@@ -73,21 +73,30 @@ class DetailedMetricsTracker:
             valid_logits = flat_logits[flat_valid_mask]
             valid_labels = flat_labels[flat_valid_mask]
             
-            # Compute probabilities once
-            probs = torch.softmax(valid_logits, dim=-1)
+            # Compute probabilities once with numerical stability
+            # Clamp logits to prevent overflow in softmax
+            stable_logits = torch.clamp(valid_logits, min=-50.0, max=50.0)
+            probs = torch.softmax(stable_logits, dim=-1)
             k = min(self.entropy_k, valid_logits.size(-1))
             top_k_probs, _ = torch.topk(probs, k=k, dim=-1)
+            
+            # Ensure probabilities are valid
+            top_k_probs = torch.clamp(top_k_probs, min=1e-10, max=1.0)
             
             metrics = {}
             
             # Overall metrics
             metrics['entropy'] = self._compute_entropy(top_k_probs[:, 0])
-            metrics['perplexity'] = min(torch.exp(loss).item(), 1e6)
+            metrics['perplexity'] = self._compute_perplexity(loss)
             
-            # Top-k probabilities
+            # Top-k probabilities with safety checks
             for top_n in [1, 2, 5, 10]:
                 if top_n <= k:
-                    metrics[f'top{top_n}_prob'] = top_k_probs[:, :top_n].sum(dim=-1).mean().item()
+                    top_n_sum = top_k_probs[:, :top_n].sum(dim=-1)
+                    # Ensure finite values
+                    top_n_sum = torch.where(torch.isfinite(top_n_sum), top_n_sum, torch.zeros_like(top_n_sum))
+                    mean_val = top_n_sum.mean().item()
+                    metrics[f'top{top_n}_prob'] = mean_val if not torch.isnan(torch.tensor(mean_val)) else 0.0
             
             # Masked metrics for reasoning and tool_call
             if reasoning_mask is not None or tool_call_mask is not None:
@@ -101,12 +110,36 @@ class DetailedMetricsTracker:
     
     def _compute_entropy(self, top1_probs: torch.Tensor) -> float:
         """Compute binary Shannon entropy efficiently."""
+        if top1_probs.numel() == 0:
+            return 0.0
+            
         epsilon = 1e-8
         p = torch.clamp(top1_probs, min=epsilon, max=1.0 - epsilon)
-        entropy = -(p * torch.log2(p) + (1 - p) * torch.log2(1 - p))
-        entropy = torch.where((top1_probs < epsilon) | (top1_probs > 1.0 - epsilon),
-                             torch.zeros_like(entropy), entropy)
-        return entropy.mean().item()
+        
+        # Compute log terms safely
+        log_p = torch.log2(p)
+        log_1_minus_p = torch.log2(1 - p)
+        
+        # Check for NaN or inf values and replace with 0
+        log_p = torch.where(torch.isfinite(log_p), log_p, torch.zeros_like(log_p))
+        log_1_minus_p = torch.where(torch.isfinite(log_1_minus_p), log_1_minus_p, torch.zeros_like(log_1_minus_p))
+        
+        entropy = -(p * log_p + (1 - p) * log_1_minus_p)
+        
+        # Final safety check for NaN values
+        entropy = torch.where(torch.isfinite(entropy), entropy, torch.zeros_like(entropy))
+        
+        result = entropy.mean().item()
+        return result if not torch.isnan(torch.tensor(result)) else 0.0
+    
+    def _compute_perplexity(self, loss: torch.Tensor) -> float:
+        """Compute perplexity with numerical stability."""
+        # Clamp loss to prevent overflow in exp
+        clamped_loss = torch.clamp(loss, min=-50.0, max=50.0)
+        perplexity = torch.exp(clamped_loss).item()
+        
+        # Cap perplexity at reasonable maximum
+        return min(perplexity, 1e6) if not torch.isnan(torch.tensor(perplexity)) else 1e6
     
     def _compute_masked_metrics(
         self,
@@ -132,15 +165,18 @@ class DetailedMetricsTracker:
             valid_indices = torch.cumsum(flat_valid_mask, dim=0) - 1
             reasoning_indices = valid_indices[reasoning_valid]
             
-            if reasoning_indices.numel() > 0:
+            if reasoning_indices.numel() > 0 and reasoning_indices.max() < all_top_k_probs.size(0):
                 reasoning_probs = all_top_k_probs[reasoning_indices]
                 
                 metrics['reasoning_entropy'] = self._compute_entropy(reasoning_probs[:, 0])
-                metrics['reasoning_perplexity'] = min(torch.exp(loss).item(), 1e6)
+                metrics['reasoning_perplexity'] = self._compute_perplexity(loss)
                 
                 for top_n in [1, 2, 5, 10]:
                     if top_n <= k:
-                        metrics[f'reasoning_top{top_n}_prob'] = reasoning_probs[:, :top_n].sum(dim=-1).mean().item()
+                        top_n_sum = reasoning_probs[:, :top_n].sum(dim=-1)
+                        top_n_sum = torch.where(torch.isfinite(top_n_sum), top_n_sum, torch.zeros_like(top_n_sum))
+                        mean_val = top_n_sum.mean().item()
+                        metrics[f'reasoning_top{top_n}_prob'] = mean_val if not torch.isnan(torch.tensor(mean_val)) else 0.0
         
         if tool_call_mask is not None:
             # Get shifted mask to align with labels
@@ -153,14 +189,17 @@ class DetailedMetricsTracker:
             valid_indices = torch.cumsum(flat_valid_mask, dim=0) - 1
             tool_call_indices = valid_indices[tool_call_valid]
             
-            if tool_call_indices.numel() > 0:
+            if tool_call_indices.numel() > 0 and tool_call_indices.max() < all_top_k_probs.size(0):
                 tool_call_probs = all_top_k_probs[tool_call_indices]
                 
                 metrics['tool_call_entropy'] = self._compute_entropy(tool_call_probs[:, 0])
-                metrics['tool_call_perplexity'] = min(torch.exp(loss).item(), 1e6)
+                metrics['tool_call_perplexity'] = self._compute_perplexity(loss)
                 
                 for top_n in [1, 2, 5, 10]:
                     if top_n <= k:
-                        metrics[f'tool_call_top{top_n}_prob'] = tool_call_probs[:, :top_n].sum(dim=-1).mean().item()
+                        top_n_sum = tool_call_probs[:, :top_n].sum(dim=-1)
+                        top_n_sum = torch.where(torch.isfinite(top_n_sum), top_n_sum, torch.zeros_like(top_n_sum))
+                        mean_val = top_n_sum.mean().item()
+                        metrics[f'tool_call_top{top_n}_prob'] = mean_val if not torch.isnan(torch.tensor(mean_val)) else 0.0
         
         return metrics
