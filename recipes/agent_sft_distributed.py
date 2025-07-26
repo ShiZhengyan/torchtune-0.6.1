@@ -29,8 +29,10 @@ from torchtune import config, modules, training, utils
 from torchtune.config._utils import _get_component_from_path
 from torchtune.data import padded_collate_packed
 from torchtune.datasets import ConcatDataset
+from torchtune.datasets._agent_sft import AgentSFTDataset
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import DummyProfiler, PROFILER_KEY
+from torchtune.training._detailed_metrics import DetailedMetricsTracker
 from torchtune.training.activations import apply_selective_activation_checkpointing
 from torchtune.training.checkpointing._checkpoint_client import (
     CheckpointClient,
@@ -43,89 +45,16 @@ from tqdm import tqdm
 log = utils.get_logger("DEBUG")
 
 
-class FullFinetuneRecipeDistributed(FTRecipeInterface):
+class AgentSFTRecipeDistributed(FTRecipeInterface):
     """
-    Full finetuning recipe for dense transformer-based LLMs such as Llama2. This recipe supports
-    distributed training and can be run on a single node (1 to 8 GPUs).
-
-    Features:
-        - FSDP. Supported using PyTorch's FSDP APIs. CPU offload of parameters, gradients, and optimizer states
-            is supported via ``fsdp_cpu_offload``. Resharding of parameters after the forward pass is
-            done by default (corresponding to FULL_SHARD sharding strategy), but can be disabled by setting the config
-            ``fsdp_reshard_after_forward`` to False (this corresponds to SHARD_GRAD_OP sharding strategy).
-            DDP is currently not supported. Training on CPU is not supported.
-
-        - Activation Checkpointing. This can be controlled using the ``enable_activation_checkpointing``
-            flag. Activation checkpointing helps reduce the memory footprint since we no longer keep
-            activations in memory and instead recompute them during the backward pass. This is especially
-            helpful for larger batch sizes when you're memory constrained. But these savings in memory
-            come at the cost of training performance. In most cases training can slow-down quite a bit as
-            a result of this activation recomputation.
-
-        - Activation Offloading. This can be controlled using the ``enable_activation_offloading``
-            flag. Activation offloading is a technique similar to activations checkpointing that helps
-            reduce the memory footprint to prevent OOMs on CUDA and enable bigger batches. Where activations
-            checkpointing drops the activation in the forward to recompute it later in the backward,
-            activations offloading will drop the activation in the forward to the CPU and bring it
-            back during the backward pass. As always, there is a tradeoff--these savings in memory can
-            come at the cost of training performance and CPU resources. To recover some runtime cost,
-            we've added an option to enable offloading on a different stream to permit overlapping with
-            the computation. This option is currently only available on PyTorch 2.5 or later and will
-            be enabled by default if an acceptable torch version is found. Activation offloading can be
-            used in conjunction with activation checkpointing.
-
-        - Precision. Full fp32 and bf16 training are supported. Precision is controlled using the ``dtype``
-            flag. When ``dtype=bf16``, all activations, gradients and optimizer states are in bfloat16. In
-            most cases this should halve the memory footprint of full precision (fp32) training, without
-            loss in model quality (will depend on the model, training data and other settings). For
-            GPUs which do not support bfloat16, we fall back to fp32. Mixed precision training and fp16
-            precision are currently not supported.
-
-        - Gradient Accumulation. You can simulate larger batch sizes by accumulating gradients. This is
-            controlled using the ``gradient_accumulation_steps`` flag.
-
-                Total Batch Size = batch_size * number of GPUs * gradient accumulation steps.
-
-            For example: with batch_size=1, nproc_per_node=2 and gradient_accumulation_steps=32 we get a
-            total batch size of 64.
-
-            Gradient accumulation is especially useful when you are memory constrained. In this case,
-            accumulating gradients might give you better training speed than enabling activation
-            checkpointing.
-
-        - Checkpointing. Model weights are checkpointed both at the end of each epoch and at the end of
-            training. Optimizer state and recipe state (seed, total_epochs, number of epochs run etc) are
-            only saved at the end of a given epoch and used in case of resuming training.
-
-            Resuming training is controlled by the ``resume_from_checkpoint`` flag. Mid-epoch checkpointing is
-            currently not supported.
-
-            For more details on the checkpointer, please take a look at
-            our checkpointer deepdive (https://pytorch.org/torchtune/main/deep_dives/checkpointer.html).
-
-        - Logging. Terminal, Disk, WandB and TensorBoard are all supported.
-
-        - Gradient Clipping. Gradient clipping is supported using the ``clip_grad_norm`` flag. By default,
-            ``clip_grad_norm`` is set to ``None``. If you only want to log the grad norm, you can set
-            ``clip_grad_norm='inf'``.
-
-        - Validation. Optional validation during training is supported by providing a ``dataset_val`` 
-            configuration. Validation loss is computed and logged at regular intervals (controlled by 
-            ``run_val_every_n_steps``) and at the end of each epoch. The validation dataset uses 
-            a separate batch size (``batch_size_val``) which defaults to the training batch size.
-
-    For a full list of example configs for this recipe, run ``tune ls`` on the command line. Each config
-    has example commands for how to kick-off training.
-
-    Args:
-        cfg (DictConfig): OmegaConf object parsed from yaml file
-
-    Raises:
-        ValueError: If ``dtype`` is set to fp16.
-        RuntimeError: If ``dtype`` is set to bf16 and the hardware does not support bf16.
-        RuntimeError: If ``left_pad_sequence`` is set as the data collator.
-        RuntimeError: If ``enable_activation_offloading`` is True and device is not CUDA.
-        RuntimeError: If ``enable_activation_offloading`` is True and ``enable_activation_checkpointing`` is False.
+    Agent SFT training recipe with detailed metrics tracking for distributed training.
+    
+    This recipe extends the base full finetuning functionality with:
+    - Detailed metrics tracking (entropy, perplexity, top-k probabilities)
+    - Token classification for reasoning vs tool calling
+    - Enhanced data preprocessing for agent training
+    
+    All features from FullFinetuneRecipeDistributed are supported, plus agent-specific enhancements.
     """
 
     def __init__(self, cfg: DictConfig) -> None:
@@ -192,6 +121,22 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._run_val_every_n_steps = cfg.get("run_val_every_n_steps", 500) if self._enable_validation else None
         self._batch_size_val = cfg.get("batch_size_val", cfg.batch_size) if self._enable_validation else None
         self._last_val_loss = None  # Track the latest validation loss for display
+
+        # Agent SFT specific configurations
+        self._enable_detailed_metrics = cfg.get("enable_detailed_metrics", True)
+        self._enable_token_classification = cfg.get("enable_token_classification", True)
+        self._entropy_k = cfg.get("entropy_k", 10)
+        self._log_detailed_metrics_every_n_steps = cfg.get("log_detailed_metrics_every_n_steps", 10)
+
+        # Initialize detailed metrics tracker
+        if self._enable_detailed_metrics:
+            self._metrics_tracker = DetailedMetricsTracker(
+                entropy_k=self._entropy_k,
+                device=self._device,
+                dtype=self._dtype,
+            )
+            if self._is_rank_zero:
+                log.info(f"📊 Detailed metrics tracking enabled with entropy_k={self._entropy_k}")
 
         # Optimizer in backward is not compatible with gradient accumulation or gradient clipping
         if self._optimizer_in_bwd:
@@ -470,41 +415,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
     ) -> Union[torch.profiler.profile, DummyProfiler]:
         """
         Parses the `profiler` section of top-level `cfg` and sets up profiler
-
-        Args:
-            cfg_profiler (Optional[DictConfig]): ``profiler`` section of the top-level ``cfg`` (the main config passed to
-                `recipe.main`). Default None.
-
-        Returns:
-            profiler: Union[torch.profiler.profile, DummyProfiler] - DummyProfiler is a nullcontext with no-op methods
-            for `start`, `stop`, and `step` that can be used in place of `torch.profiler.profile` if profiler is not enabled such
-            that the instrumented training loop does not need to be changed profiling is disabled.
-
-        The profiler config can be provided in configs under the `profiler` key with the following layout:
-
-        .. code-block:: yaml
-            profiler:
-                enabled: bool
-
-                #Output directory of trace artifacts
-                output_dir: str
-
-            #`torch.profiler.ProfilerActivity` types to trace
-            cpu: bool
-            cuda: bool
-
-                #Trace options
-                profile_memory: bool
-                with_stack: bool
-                record_shapes: bool
-                with_flops: bool
-
-            # `torch.profiler.schedule` options:
-            # wait_steps -> wait, warmup_steps -> warmup, active_steps -> active, num_cycles -> repeat
-            wait_steps: int
-            warmup_steps: int
-            active_steps: int
-            num_cycles: int
         """
         # Missing profiler section in config, assume disabled
         if cfg_profiler is None:
@@ -718,19 +628,28 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         dataloader_state_dict: Optional[Dict[str, Any]] = None,
     ) -> StatefulDataLoader:
         """
-        All data related setup happens here. This recipe currently supports only
-        map-style datasets. If a state_dict is provided (meaning we are resuming a training run),
-        it is loaded into the dataloader.
+        All data related setup happens here. This recipe supports enhanced agent SFT datasets
+        that include token classification for detailed metrics tracking.
         """
         if isinstance(cfg_dataset, ListConfig):
-            datasets = [
-                config.instantiate(single_cfg_dataset, self._tokenizer)
-                for single_cfg_dataset in cfg_dataset
-            ]
+            datasets = []
+            for single_cfg_dataset in cfg_dataset:
+                # Use AgentSFTDataset if it's configured for agent training
+                if single_cfg_dataset.get("_component_", "").endswith("AgentSFTDataset"):
+                    ds = config.instantiate(single_cfg_dataset, self._tokenizer)
+                else:
+                    # Fallback to regular SFT dataset for compatibility
+                    ds = config.instantiate(single_cfg_dataset, self._tokenizer)
+                datasets.append(ds)
             ds = ConcatDataset(datasets=datasets)
             packed = getattr(ds, "packed", False)
         else:
-            ds = config.instantiate(cfg_dataset, self._tokenizer)
+            # Use AgentSFTDataset if configured for agent training
+            if cfg_dataset.get("_component_", "").endswith("AgentSFTDataset"):
+                ds = config.instantiate(cfg_dataset, self._tokenizer)
+            else:
+                # Fallback to regular SFT dataset for compatibility
+                ds = config.instantiate(cfg_dataset, self._tokenizer)
             packed = cfg_dataset.get("packed", False)
 
         # Instantiate collate_fn
@@ -760,6 +679,33 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         return dataloader
 
+    def _compute_detailed_metrics(
+        self, 
+        logits: torch.Tensor, 
+        labels: torch.Tensor, 
+        loss: torch.Tensor,
+        batch: Dict[str, Any]
+    ) -> Dict[str, float]:
+        """
+        Compute detailed metrics if enabled.
+        """
+        if not self._enable_detailed_metrics:
+            return {}
+            
+        # Extract token classification masks if available
+        reasoning_mask = batch.get("reasoning_mask", None)
+        tool_call_mask = batch.get("tool_call_mask", None)
+        
+        metrics = self._metrics_tracker.compute_metrics(
+            logits=logits,
+            labels=labels,
+            loss=loss,
+            reasoning_mask=reasoning_mask,
+            tool_call_mask=tool_call_mask,
+        )
+        
+        return metrics
+
     def validate(self) -> float:
         """
         Run validation loop and return average validation loss.
@@ -771,6 +717,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         
         total_val_loss = torch.tensor(0.0, device=self._device, dtype=self._dtype)
         total_val_tokens = torch.tensor(0, device=self._device, dtype=torch.long)
+        
+        # Accumulate detailed metrics for validation
+        val_detailed_metrics = {}
+        val_metrics_count = 0
         
         # Create validation progress bar - only show on rank 0
         val_pbar = tqdm(
@@ -791,26 +741,55 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     batch["labels"] != self._loss_fn.ignore_index
                 ).sum()
                 
+                # Store batch size before popping labels
+                batch_size = batch["labels"].shape[0]
+                
                 labels = batch.pop("labels")
                 
                 with self.activations_handling_ctx:
                     logits = self._model(**batch)
-                print(f"Validation Logits Type: {type(logits)}")
-                print(f"labels shape: {labels.shape}, labels type: {type(labels)}")
+
+                # Store original labels for metrics computation (before shifting)
+                original_labels = labels.clone()
                 
+                # Reconstruct full logits tensor if chunked for metrics computation
+                logits_for_metrics = None
+                if isinstance(logits, list):
+                    # Concatenate chunked logits back to original shape
+                    logits_for_metrics = torch.cat(logits, dim=1)
+                    # print(f"Concatenated logits shape: {logits_for_metrics.shape}")
+                    # print(f"Original labels shape: {original_labels.shape}")
+                else:
+                    logits_for_metrics = logits
+
                 # Shift labels to compute loss
                 labels = torch.hstack(
                     (labels[..., 1:], self.ignore_labels_cache[: labels.shape[0]])
                 )
+
                 if not isinstance(logits, list):
                     labels = labels.reshape(-1)
                     logits = logits.reshape(-1, logits.size(-1))
-                
+
                 # Compute validation loss (normalized by number of tokens)
                 val_loss = self._loss_fn(logits, labels) * current_num_tokens
-                
+
                 total_val_loss += val_loss
                 total_val_tokens += current_num_tokens
+
+                # Compute detailed metrics for validation
+                if self._enable_detailed_metrics and batch_idx % self._log_detailed_metrics_every_n_steps == 0 and logits_for_metrics is not None:
+                    batch_metrics = self._compute_detailed_metrics(
+                        logits_for_metrics, original_labels, val_loss / current_num_tokens, batch
+                    )
+                    
+                    # Accumulate metrics
+                    for key, value in batch_metrics.items():
+                        if key in val_detailed_metrics:
+                            val_detailed_metrics[key] += value
+                        else:
+                            val_detailed_metrics[key] = value
+                    val_metrics_count += 1
                 
                 # Update progress bar with current validation loss (only on rank 0)
                 if self._is_rank_zero:
@@ -832,6 +811,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # Calculate average validation loss
         avg_val_loss = total_val_loss.item() / total_val_tokens.item() if total_val_tokens.item() > 0 else 0.0
         
+        # Average detailed metrics and log them
+        if self._enable_detailed_metrics and val_metrics_count > 0 and self._is_rank_zero:
+            avg_val_detailed_metrics = {
+                f"val_{key}": value / val_metrics_count 
+                for key, value in val_detailed_metrics.items()
+            }
+            self._metric_logger.log_dict(avg_val_detailed_metrics, step=self.global_step)
+        
         # Set model back to training mode
         self._model.train()
         
@@ -842,7 +829,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def train(self) -> None:
         """
-        The core training loop.
+        The core training loop with detailed metrics tracking.
         """
         # clean up before training begins
         training.cleanup_before_training()
@@ -883,20 +870,35 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ).sum()
                 num_tokens += current_num_tokens
 
+                # Store batch size before popping labels
+                batch_size = batch["labels"].shape[0]
+
                 # Shape [b, s], needed for the loss not the model
                 labels = batch.pop("labels")
 
                 with self.activations_handling_ctx:
                     logits = self._model(**batch)
-                print(f"Train Logits Type: {type(logits)}")
-                print(f"labels shape: {labels.shape}, labels type: {type(labels)}")
-
+                
+                # Store original labels for metrics computation (before shifting)
+                original_labels = labels.clone()
+                
+                # Reconstruct full logits tensor if chunked for metrics computation
+                logits_for_metrics = None
+                if isinstance(logits, list):
+                    # Concatenate chunked logits back to original shape
+                    logits_for_metrics = torch.cat(logits, dim=1)
+                    # print(f"Concatenated logits shape: {logits_for_metrics.shape}")
+                    # print(f"Original labels shape: {original_labels.shape}")
+                else:
+                    logits_for_metrics = logits
+    
                 # Shift labels to compute loss
                 # equivalent to doing labels[..., 1:] and logits[..., :-1, :]
                 # But this way we dont need to slice the logits. We just add an ignore index to labels.
                 labels = torch.hstack(
                     (labels[..., 1:], self.ignore_labels_cache[: labels.shape[0]])
                 )
+                
                 if not isinstance(logits, list):
                     labels = labels.reshape(-1)
                     logits = logits.reshape(-1, logits.size(-1))
@@ -905,6 +907,23 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
                 current_loss = self._loss_fn(logits, labels) * current_num_tokens
+
+                # Compute detailed metrics if enabled
+                if (
+                    self._enable_detailed_metrics 
+                    and self.global_step % self._log_detailed_metrics_every_n_steps == 0
+                    and logits_for_metrics is not None
+                ):
+                    detailed_metrics = self._compute_detailed_metrics(
+                        logits_for_metrics, original_labels, current_loss / current_num_tokens, batch
+                    )
+                    
+                    if detailed_metrics and self._is_rank_zero:
+                        # Add train prefix to metrics
+                        train_detailed_metrics = {
+                            f"train_{key}": value for key, value in detailed_metrics.items()
+                        }
+                        self._metric_logger.log_dict(train_detailed_metrics, step=self.global_step)
 
                 # free logits otherwise it peaks backward memory
                 del logits
@@ -1087,14 +1106,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 @config.parse
 def recipe_main(cfg: DictConfig) -> None:
     """
-    Entry point for the recipe.
+    Entry point for the agent SFT recipe.
 
     Configurable parameters are read in the following order:
         - Parameters specified in config (see available configs through ``tune ls``)
         - Overwritten by arguments from the command-line
     """
-    config.log_config(recipe_name="FullFinetuneRecipeDistributed", cfg=cfg)
-    recipe = FullFinetuneRecipeDistributed(cfg=cfg)
+    config.log_config(recipe_name="AgentSFTRecipeDistributed", cfg=cfg)
+    recipe = AgentSFTRecipeDistributed(cfg=cfg)
     recipe.setup(cfg=cfg)
     recipe.train()
     recipe.cleanup()

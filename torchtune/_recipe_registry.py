@@ -142,6 +142,17 @@ _ALL_RECIPES = [
         supports_distributed=True,
     ),
     Recipe(
+        name="agent_sft_distributed",
+        file_path="agent_sft_distributed.py",
+        configs=[
+            Config(
+                name="agent_sft_distributed",
+                file_path="agent_sft_distributed.yaml",
+            ),
+        ],
+        supports_distributed=True,
+    ),
+    Recipe(
         name="lora_finetune_single_device",
         file_path="lora_finetune_single_device.py",
         configs=[

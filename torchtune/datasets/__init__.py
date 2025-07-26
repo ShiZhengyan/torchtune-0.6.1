@@ -16,6 +16,7 @@ from torchtune.datasets._packed import PackedDataset
 from torchtune.datasets._preference import preference_dataset, PreferenceDataset
 from torchtune.datasets._samsum import samsum_dataset
 from torchtune.datasets._sft import SFTDataset
+from torchtune.datasets._agent_sft import AgentSFTDataset, AgentSFTTransform, classify_tokens_for_tool_calling
 from torchtune.datasets._slimorca import slimorca_dataset
 from torchtune.datasets._stack_exchange_paired import stack_exchange_paired_dataset
 from torchtune.datasets._text_completion import (
@@ -42,6 +43,9 @@ __all__ = [
     "wikitext_dataset",
     "PreferenceDataset",
     "SFTDataset",
+    "AgentSFTDataset",
+    "AgentSFTTransform",
+    "classify_tokens_for_tool_calling",
     "hh_rlhf_helpful_dataset",
     "multimodal",
 ]

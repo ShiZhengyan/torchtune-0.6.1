@@ -9,6 +9,7 @@ from torchtune.training._activation_offloading import (
     OffloadActivations,
 )
 from torchtune.training._compile import compile_loss, compile_model
+from torchtune.training._detailed_metrics import DetailedMetricsTracker
 from torchtune.training._distributed import (
     gather_cpu_state_dict,
     get_distributed_backend,
@@ -139,4 +140,5 @@ __all__ = [
     "scale_grads",
     "disable_dropout",
     "DATALOADER_KEY",
+    "DetailedMetricsTracker",
 ]
