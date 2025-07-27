@@ -41,40 +41,73 @@ def classify_tokens_for_tool_calling(
     function_block_pattern = re.compile(r'<function=[^>]+>.*?</function>', re.DOTALL)
     function_blocks = list(function_block_pattern.finditer(text))
     
-    # Convert input_ids to tokens for classification
-    tokens = tokenizer.convert_ids_to_tokens(input_ids)
-    seq_len = len(tokens)
+    seq_len = len(input_ids)
     
     # Initialize classification masks
     reasoning_mask = torch.ones(seq_len, dtype=torch.bool)  # Default to reasoning
     tool_call_mask = torch.zeros(seq_len, dtype=torch.bool)
     
-    # Reconstruct text with token-to-position mapping
-    token_char_spans = []
-    reconstructed_text = ""
+    # Get special token IDs efficiently
+    def get_special_token_ids(tokenizer):
+        """Get special token IDs using tokenizer's native methods."""
+        special_ids = set()
+        
+        # TorchTune tokenizer: use special_tokens dict
+        if hasattr(tokenizer, 'special_tokens') and isinstance(tokenizer.special_tokens, dict):
+            special_ids.update(tokenizer.special_tokens.values())
+        
+        # HuggingFace tokenizer: use all_special_ids
+        elif hasattr(tokenizer, 'all_special_ids'):
+            special_ids.update(tokenizer.all_special_ids)
+        
+        return special_ids
     
-    for i, token in enumerate(tokens):
-        # Handle special tokens
-        if hasattr(tokenizer, 'pad_token') and token == tokenizer.pad_token:
+    special_token_ids = get_special_token_ids(tokenizer)
+    
+    # Get token text using the best available method
+    def get_token_text(tokenizer, token_id):
+        """Get text representation of a token."""
+        # Method 1: TorchTune style - use _convert_id_to_token + _convert_tokens_to_string
+        if hasattr(tokenizer, '_convert_id_to_token') and hasattr(tokenizer, '_convert_tokens_to_string'):
+            token = tokenizer._convert_id_to_token(token_id)
+            return tokenizer._convert_tokens_to_string([token])
+        
+        # Method 2: HF style - use convert_ids_to_tokens + convert_tokens_to_string  
+        elif hasattr(tokenizer, 'convert_ids_to_tokens') and hasattr(tokenizer, 'convert_tokens_to_string'):
+            token = tokenizer.convert_ids_to_tokens([token_id])[0]
+            return tokenizer.convert_tokens_to_string([token])
+        
+        # Method 3: Universal fallback - decode single token
+        else:
+            try:
+                return tokenizer.decode([token_id], skip_special_tokens=False)
+            except Exception:
+                return ""
+    
+    # Build character spans for each token
+    token_char_spans = []
+    cumulative_pos = 0
+    
+    for i, token_id in enumerate(input_ids.tolist()):
+        # Skip special tokens - they don't contribute to reasoning/tool_call classification
+        if token_id in special_token_ids:
             reasoning_mask[i] = False
-            token_char_spans.append((len(reconstructed_text), len(reconstructed_text)))
-            continue
-        if hasattr(tokenizer, 'eos_token') and token == tokenizer.eos_token:
-            reasoning_mask[i] = False
-            token_char_spans.append((len(reconstructed_text), len(reconstructed_text)))
-            continue
-        if hasattr(tokenizer, 'bos_token') and token == tokenizer.bos_token:
-            reasoning_mask[i] = False
-            token_char_spans.append((len(reconstructed_text), len(reconstructed_text)))
+            token_char_spans.append((cumulative_pos, cumulative_pos))
             continue
         
-        # Convert token to text
-        token_text = tokenizer.convert_tokens_to_string([token])
+        # Get token text
+        token_text = get_token_text(tokenizer, token_id)
         
-        # Record the character span for this token
-        start_pos = len(reconstructed_text)
-        reconstructed_text += token_text
-        end_pos = len(reconstructed_text)
+        # Skip empty tokens
+        if not token_text:
+            reasoning_mask[i] = False
+            token_char_spans.append((cumulative_pos, cumulative_pos))
+            continue
+        
+        # Record character span for this token
+        start_pos = cumulative_pos
+        end_pos = cumulative_pos + len(token_text)
+        cumulative_pos = end_pos
         token_char_spans.append((start_pos, end_pos))
     
     # Classify tokens based on their position relative to function blocks
@@ -84,12 +117,14 @@ def classify_tokens_for_tool_calling(
             
         # Check if token overlaps with any function block
         is_in_tool_call = False
-        for block in function_blocks:
+        overlapping_block = None
+        for block_idx, block in enumerate(function_blocks):
             block_start, block_end = block.span()
             
             # Check if token overlaps with this function block
             if not (end_pos <= block_start or start_pos >= block_end):
                 is_in_tool_call = True
+                overlapping_block = block_idx
                 break
         
         if is_in_tool_call:
@@ -249,6 +284,8 @@ class AgentSFTTransform(Transform):
             except Exception as e:
                 # If token classification fails, continue without it
                 # This ensures compatibility when tokenizer doesn't support the required methods
-                pass
+                print(f"⚠️  Token classification failed: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
         
         return transformed_sample
