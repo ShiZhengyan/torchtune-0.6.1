@@ -751,6 +751,10 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
                 
                 labels = batch.pop("labels")
                 
+                # Pop masks that are used for metrics but not for model forward
+                reasoning_mask = batch.pop("reasoning_mask", None)
+                tool_call_mask = batch.pop("tool_call_mask", None)
+                
                 with self.activations_handling_ctx:
                     logits = self._model(**batch)
 
@@ -784,6 +788,12 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
 
                 # Compute detailed metrics for validation
                 if self._enable_detailed_metrics and batch_idx % self._log_detailed_metrics_every_n_steps == 0 and logits_for_metrics is not None:
+                    # Add masks back to batch for metrics computation
+                    if reasoning_mask is not None:
+                        batch["reasoning_mask"] = reasoning_mask
+                    if tool_call_mask is not None:
+                        batch["tool_call_mask"] = tool_call_mask
+                    
                     batch_metrics = self._compute_detailed_metrics(
                         logits_for_metrics, original_labels, val_loss / current_num_tokens, batch
                     )
@@ -880,6 +890,10 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
 
                 # Shape [b, s], needed for the loss not the model
                 labels = batch.pop("labels")
+                
+                # Pop masks that are used for metrics but not for model forward
+                reasoning_mask = batch.pop("reasoning_mask", None)
+                tool_call_mask = batch.pop("tool_call_mask", None)
 
                 with self.activations_handling_ctx:
                     logits = self._model(**batch)
@@ -919,6 +933,12 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
                     and self.global_step % self._log_detailed_metrics_every_n_steps == 0
                     and logits_for_metrics is not None
                 ):
+                    # Add masks back to batch for metrics computation
+                    if reasoning_mask is not None:
+                        batch["reasoning_mask"] = reasoning_mask
+                    if tool_call_mask is not None:
+                        batch["tool_call_mask"] = tool_call_mask
+                    
                     detailed_metrics = self._compute_detailed_metrics(
                         logits_for_metrics, original_labels, current_loss / current_num_tokens, batch
                     )
