@@ -320,6 +320,26 @@ _ALL_RECIPES = [
                 name="llama3_2_vision/11B_qlora_single_device",
                 file_path="llama3_2_vision/11B_qlora_single_device.yaml",
             ),
+            Config(
+                name="qwen3/0.6B_lora_single_device",
+                file_path="qwen3/0.6B_lora_single_device.yaml",
+            ),
+            Config(
+                name="qwen3/1.7B_lora_single_device",
+                file_path="qwen3/1.7B_lora_single_device.yaml",
+            ),
+            Config(
+                name="qwen3/4B_lora_single_device",
+                file_path="qwen3/4B_lora_single_device.yaml",
+            ),
+            Config(
+                name="qwen3/8B_lora_single_device",
+                file_path="qwen3/8B_lora_single_device.yaml",
+            ),
+            Config(
+                name="qwen3/14B_lora_single_device",
+                file_path="qwen3/14B_lora_single_device.yaml",
+            ),
         ],
         supports_distributed=False,
     ),
