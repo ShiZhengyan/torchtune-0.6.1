@@ -18,83 +18,70 @@ from torchtune.modules.transforms.tokenizers import ModelTokenizer
 
 
 def classify_tokens_for_tool_calling(
-    text: str, 
-    input_ids: torch.Tensor, 
-    tokenizer
+    text: str,
+    input_ids: torch.Tensor,
+    tokenizer,
+    labels: torch.Tensor = None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Classify tokens for tool calling metrics during preprocessing.
-    
-    Simplified approach that avoids complex character-to-token mapping:
-    - REASONING: Normal conversation text outside <function>...</function> blocks
-    - TOOL_CALL: Entire <function>...</function> blocks as holistic units
-    
-    Args:
-        text: Original text string
-        input_ids: Tokenized input IDs
-        tokenizer: Tokenizer used for encoding
-        
-    Returns:
-        Dictionary containing reasoning_mask and tool_call_mask tensors
+    Classify assistant tokens into reasoning / tool-call / special categories.
+
+    A token is tagged as TOOL_CALL iff any part of its character span overlaps a
+    `<function …>` … `</function>` block in the decoded text (inclusive of the
+    tags).  Special tokens and tokens whose label equals
+    `CROSS_ENTROPY_IGNORE_IDX` are excluded from both categories.
     """
     seq_len = len(input_ids)
-    
-    # Initialize classification masks - default everything to reasoning
+
+    # Default: everything is reasoning
     reasoning_mask = torch.ones(seq_len, dtype=torch.bool)
     tool_call_mask = torch.zeros(seq_len, dtype=torch.bool)
-    
-    try:
-        # Find all function blocks in the original text
-        function_block_pattern = re.compile(r'<function=[^>]+>.*?</function>', re.DOTALL)
-        function_blocks = list(function_block_pattern.finditer(text))
-        
-        # If no function blocks found, everything is reasoning
-        if not function_blocks:
-            return {
-                "reasoning_mask": reasoning_mask,  
-                "tool_call_mask": tool_call_mask
-            }
-        
-        # Get special token IDs to exclude from classification
-        special_token_ids = get_special_token_ids(tokenizer)
-        
-        # Simple approach: estimate which portion of tokens correspond to function blocks
-        # based on character proportions in the original text
-        total_text_chars = len(text)
-        total_function_chars = sum(block.end() - block.start() for block in function_blocks)
-        
-        if total_text_chars > 0 and total_function_chars > 0:
-            # Rough estimate of what fraction of tokens should be tool_call
-            function_ratio = total_function_chars / total_text_chars
-            estimated_tool_tokens = int(function_ratio * seq_len)
-            
-            # Find sequences that look like function calls by pattern matching
-            # Look for patterns that might indicate function boundaries
-            tool_call_regions = find_tool_call_token_regions(
-                input_ids, tokenizer, special_token_ids, estimated_tool_tokens
-            )
-            
-            # Mark identified regions as tool_call tokens
-            for start_idx, end_idx in tool_call_regions:
-                for i in range(start_idx, min(end_idx, seq_len)):
-                    if input_ids[i].item() not in special_token_ids:
-                        reasoning_mask[i] = False
-                        tool_call_mask[i] = True
-        
-        # Mark special tokens as neither reasoning nor tool_call
-        for i, token_id in enumerate(input_ids.tolist()):
-            if token_id in special_token_ids:
-                reasoning_mask[i] = False
-                tool_call_mask[i] = False
-        
-        return {
-            "reasoning_mask": reasoning_mask,  
-            "tool_call_mask": tool_call_mask
-        }
-        
-    except Exception as e:
-        # If classification fails completely, raise the error instead of silently continuing
-        raise RuntimeError(f"Token classification failed: {type(e).__name__}: {e}") from e
+
+    # Identify special tokens once
+    special_token_ids = get_special_token_ids(tokenizer)
+
+    # Locate all function blocks in *text*
+    block_spans = [
+        (m.start(), m.end())
+        for m in re.finditer(r"<function[^>]*?>.*?</function>", text, flags=re.DOTALL)
+    ]
+
+    # Pre-compute per-token character spans in *text*
+    token_spans = []
+    cur = 0
+    for tid in input_ids.tolist():
+        tok_str = tokenizer.decode([tid], skip_special_tokens=False)
+        token_spans.append((cur, cur + len(tok_str)))
+        cur += len(tok_str)
+
+    # Helper to know if a span overlaps any function block
+    def overlaps_function(span):
+        s, e = span
+        for bs, be in block_spans:
+            if s < be and e > bs:  # any overlap
+                return True
+        return False
+
+    # Classify each token
+    for idx, tid in enumerate(input_ids.tolist()):
+        # Exclude special tokens
+        if tid in special_token_ids:
+            reasoning_mask[idx] = False
+            continue
+
+        # Exclude ignored labels
+        if labels is not None and labels[idx] == CROSS_ENTROPY_IGNORE_IDX:
+            reasoning_mask[idx] = False
+            continue
+
+        if overlaps_function(token_spans[idx]):
+            reasoning_mask[idx] = False
+            tool_call_mask[idx] = True
+
+    return {
+        "reasoning_mask": reasoning_mask,
+        "tool_call_mask": tool_call_mask,
+    }
 
 
 def get_special_token_ids(tokenizer):
@@ -281,7 +268,7 @@ class AgentSFTDataset:
             )
             self._ds._prepare_sample = enhanced_transform
 
-        # Handle packing
+        # Handle packing·
         if packed:
             self._ds = PackedDataset(self._ds, max_seq_len=tokenizer.max_seq_len)
 
@@ -333,8 +320,13 @@ class AgentSFTTransform(Transform):
                     input_ids = torch.tensor(transformed_sample["tokens"])
                     text = self._model_transform.decode(input_ids.tolist(), skip_special_tokens=False)
                     
+                    # Get labels if available
+                    labels = None
+                    if "labels" in transformed_sample:
+                        labels = torch.tensor(transformed_sample["labels"])
+                    
                     # Classify tokens
-                    token_masks = classify_tokens_for_tool_calling(text, input_ids, self._model_transform)
+                    token_masks = classify_tokens_for_tool_calling(text, input_ids, self._model_transform, labels)
                     
                     # Add masks to the sample
                     transformed_sample["reasoning_mask"] = token_masks["reasoning_mask"].numpy().tolist()
