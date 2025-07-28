@@ -7,6 +7,7 @@
 from torchtune.data._collate import (
     left_pad_sequence,
     padded_collate,
+    padded_collate_agent_sft,
     padded_collate_dpo,
     padded_collate_packed,
     padded_collate_sft,
@@ -51,6 +52,7 @@ __all__ = [
     "ChosenRejectedToMessages",
     "QuestionAnswerTemplate",
     "ChatMLTemplate",
+    "padded_collate_agent_sft",
     "padded_collate_sft",
     "padded_collate_dpo",
     "left_pad_sequence",

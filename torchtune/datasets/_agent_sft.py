@@ -206,6 +206,7 @@ class AgentSFTDataset:
         filter_fn: Optional[Callable] = None,
         split: str = "train",
         enable_token_classification: bool = True,
+        train_on_tool_calls_only: bool = False,       # <── NEW ARG
         **load_dataset_kwargs: Dict[str, Any],
     ):
         """
@@ -229,6 +230,8 @@ class AgentSFTDataset:
                 of a given split, e.g. ``split="train[:10%]"``. Default is "train".
             enable_token_classification (bool): whether to enable token classification for agent metrics.
                 Default is True.
+            train_on_tool_calls_only (bool): whether to replace labels of non-tool-call tokens with
+                `CROSS_ENTROPY_IGNORE_IDX`. Default is True.
             **load_dataset_kwargs (Dict[str, Any]): additional keyword arguments to pass to ``load_dataset``.
         """
 
@@ -265,6 +268,7 @@ class AgentSFTDataset:
                 message_transform=message_transform,
                 model_transform=tokenizer,
                 enable_token_classification=True,
+                train_on_tool_calls_only=train_on_tool_calls_only,   # <── pass through
             )
             self._ds._prepare_sample = enhanced_transform
 
@@ -293,18 +297,22 @@ class AgentSFTTransform(Transform):
         message_transform: Optional[Transform] = None,
         model_transform: Optional[Transform] = None,
         enable_token_classification: bool = True,
+        train_on_tool_calls_only: bool = False,
     ):
         """
         Args:
             message_transform: Transform to apply to message format
             model_transform: Transform to apply for model-specific processing
             enable_token_classification: Whether to enable token classification for metrics
+            train_on_tool_calls_only: Whether to replace labels of non-tool-call tokens with
+                `CROSS_ENTROPY_IGNORE_IDX`. Default is False.
         """
         self._base_transform = SFTTransform(
             message_transform=message_transform,
             model_transform=model_transform,
         )
         self.enable_token_classification = enable_token_classification
+        self.train_on_tool_calls_only = train_on_tool_calls_only  # <── store
         self._model_transform = model_transform
         
     def __call__(self, sample: Mapping[str, Any]) -> Dict[str, Any]:
@@ -326,11 +334,20 @@ class AgentSFTTransform(Transform):
                         labels = torch.tensor(transformed_sample["labels"])
                     
                     # Classify tokens
-                    token_masks = classify_tokens_for_tool_calling(text, input_ids, self._model_transform, labels)
-                    
+                    token_masks = classify_tokens_for_tool_calling(
+                        text, input_ids, self._model_transform, labels
+                    )
                     # Add masks to the sample
-                    transformed_sample["reasoning_mask"] = token_masks["reasoning_mask"].numpy().tolist()
-                    transformed_sample["tool_call_mask"] = token_masks["tool_call_mask"].numpy().tolist()
+                    transformed_sample["reasoning_mask"] = (
+                        token_masks["reasoning_mask"].numpy().tolist()
+                    )
+                    transformed_sample["tool_call_mask"] = (
+                        token_masks["tool_call_mask"].numpy().tolist()
+                    )
+
+                    if self.train_on_tool_calls_only and "labels" in transformed_sample:
+                        labels[token_masks["tool_call_mask"] == 0] = CROSS_ENTROPY_IGNORE_IDX
+                        transformed_sample["labels"] = labels.numpy().tolist()
             except Exception as e:
                 # If token classification fails, raise the error instead of continuing
                 raise RuntimeError(f"Token classification failed: {type(e).__name__}: {e}") from e

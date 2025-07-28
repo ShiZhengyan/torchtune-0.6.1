@@ -124,7 +124,6 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
 
         # Agent SFT specific configurations
         self._enable_detailed_metrics = cfg.get("enable_detailed_metrics", True)
-        self._enable_token_classification = cfg.get("enable_token_classification", True)
         self._entropy_k = cfg.get("entropy_k", 10)
         self._log_detailed_metrics_every_n_steps = cfg.get("log_detailed_metrics_every_n_steps", 10)
 
@@ -308,7 +307,7 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
 
         # sampler and dataloader depend on the tokenizer and loss_fn and should be
         # setup after both of these are initialized
-        collate_name = cfg.get("collate_fn", "torchtune.data.padded_collate_sft")
+        collate_name = cfg.get("collate_fn", "torchtune.data.padded_collate_agent_sft")
         self._dataloader = self._setup_data(
             cfg_dataset=cfg.dataset,
             shuffle=cfg.shuffle,
@@ -636,7 +635,10 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
             for single_cfg_dataset in cfg_dataset:
                 # Use AgentSFTDataset if it's configured for agent training
                 if single_cfg_dataset.get("_component_", "").endswith("AgentSFTDataset"):
-                    ds = config.instantiate(single_cfg_dataset, self._tokenizer)
+                    ds = config.instantiate(
+                        single_cfg_dataset,
+                        self._tokenizer,
+                    )
                 else:
                     # Fallback to regular SFT dataset for compatibility
                     ds = config.instantiate(single_cfg_dataset, self._tokenizer)
@@ -646,7 +648,10 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
         else:
             # Use AgentSFTDataset if configured for agent training
             if cfg_dataset.get("_component_", "").endswith("AgentSFTDataset"):
-                ds = config.instantiate(cfg_dataset, self._tokenizer)
+                ds = config.instantiate(
+                    cfg_dataset,
+                    self._tokenizer,
+                )
             else:
                 # Fallback to regular SFT dataset for compatibility
                 ds = config.instantiate(cfg_dataset, self._tokenizer)

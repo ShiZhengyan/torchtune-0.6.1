@@ -563,3 +563,115 @@ def padded_collate_dpo(
     )
 
     return concatenated_input_ids, concatenated_labels
+
+
+def padded_collate_agent_sft(
+    batch: List[Dict[str, List[int]]],
+    padding_idx: int = 0,
+    ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
+) -> Dict[str, torch.Tensor]:
+    """Pad a batch of sequences for agent SFT training, including reasoning and tool call masks.
+
+    This collate function extends padded_collate_sft to handle additional mask tensors
+    that are used for agent training metrics and specialized loss computation.
+
+    Args:
+        batch (List[Dict[str, List[int]]]): A list of dictionaries containing input, label pairs
+            and optionally reasoning_mask and tool_call_mask.
+        padding_idx (int): Padding index for input ids. Defaults to 0.
+        ignore_idx (int): Padding index for labels. Defaults to -100.
+
+    Returns:
+        Dict[str, torch.Tensor]: Collated input, label, and mask tensors.
+
+    Example:
+        >>> token_pairs = [
+        >>>    {
+        >>>        "tokens": [1, 2, 3], 
+        >>>        "labels": [4, 5, 6],
+        >>>        "reasoning_mask": [1, 1, 0],
+        >>>        "tool_call_mask": [0, 0, 1]
+        >>>    },
+        >>>    {
+        >>>        "tokens": [7,], 
+        >>>        "labels": [10,],
+        >>>        "reasoning_mask": [1],
+        >>>        "tool_call_mask": [0]
+        >>>    },
+        >>> ]
+        >>> collated = padded_collate_agent_sft(
+        >>>    batch=token_pairs,
+        >>>    padding_idx=0,
+        >>>    ignore_idx=-100,
+        >>> )
+        >>> collated["tokens"]
+        >>> tensor([[1, 2, 3], [7, 0, 0]])
+        >>> collated["labels"]
+        >>> tensor([[4, 5, 6], [10, -100, -100]])
+        >>> collated["reasoning_mask"]
+        >>> tensor([[1, 1, 0], [1, 0, 0]])
+        >>> collated["tool_call_mask"]
+        >>> tensor([[0, 0, 1], [0, 0, 0]])
+    """
+    # Handle tokens and labels with existing logic
+    input_ids = pad_sequence(
+        [torch.tensor(x["tokens"]) for x in batch],
+        batch_first=True,
+        padding_value=padding_idx,
+    )
+    labels = pad_sequence(
+        [torch.tensor(x["labels"]) for x in batch],
+        batch_first=True,
+        padding_value=ignore_idx,
+    )
+
+    input_ids_seq_len = input_ids.shape[-1]
+    labels_seq_len = labels.shape[-1]
+
+    # Hack to pad correctly and not use max_seq_len, which is costly
+    if input_ids_seq_len > labels_seq_len:
+        labels = F.pad(
+            labels, (0, input_ids_seq_len - labels_seq_len), value=ignore_idx
+        )
+    elif labels_seq_len > input_ids_seq_len:
+        input_ids = F.pad(
+            input_ids,
+            (0, labels_seq_len - input_ids_seq_len),
+            value=padding_idx,
+        )
+
+    # Get final sequence length for mask padding
+    final_seq_len = max(input_ids_seq_len, labels_seq_len)
+    
+    # Prepare result dictionary
+    result = {"tokens": input_ids.long(), "labels": labels.long()}
+    
+    # Handle reasoning_mask if present
+    if "reasoning_mask" in batch[0]:
+        reasoning_masks = pad_sequence(
+            [torch.tensor(x["reasoning_mask"], dtype=torch.bool) for x in batch],
+            batch_first=True,
+            padding_value=False,  # Pad with False for reasoning mask
+        )
+        # Ensure reasoning mask matches final sequence length
+        if reasoning_masks.shape[-1] < final_seq_len:
+            reasoning_masks = F.pad(
+                reasoning_masks, (0, final_seq_len - reasoning_masks.shape[-1]), value=False
+            )
+        result["reasoning_mask"] = reasoning_masks
+    
+    # Handle tool_call_mask if present
+    if "tool_call_mask" in batch[0]:
+        tool_call_masks = pad_sequence(
+            [torch.tensor(x["tool_call_mask"], dtype=torch.bool) for x in batch],
+            batch_first=True,
+            padding_value=False,  # Pad with False for tool call mask
+        )
+        # Ensure tool call mask matches final sequence length
+        if tool_call_masks.shape[-1] < final_seq_len:
+            tool_call_masks = F.pad(
+                tool_call_masks, (0, final_seq_len - tool_call_masks.shape[-1]), value=False
+            )
+        result["tool_call_mask"] = tool_call_masks
+
+    return result
