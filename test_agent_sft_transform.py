@@ -26,14 +26,22 @@ def test_agent_sft_transform():
                 "content": "Let's run the reproduction script:\n\n<function=bash>\n<parameter=command>cd /testbed && python reproduce.py</parameter>\n</function>The is the reasoning end",
                 "role": "assistant"
             },
+            # {
+            # "content": "OBSERVATION:\nWARNING: replace_in_file didn't find pattern 'Pattern' in 'test.txt' file.\r\nPattern not found result: False\r\nPattern found result: None",
+            # "role": "user"
+            # },
+            # {
+            # "content": "The reproduction confirms the issue - when the pattern is not found, it returns `False`, but when the pattern is found and replaced, it returns `None`. This is inconsistent behavior.\n\nLet's fix this by making it return `True` when the pattern is found and replaced:\n\n<function=str_replace_editor>\n<parameter=command>str_replace</parameter>\n<parameter=path>/testbed/conan/tools/files/files.py</parameter>\n<parameter=old_str>\n    content = content.replace(search, replace)\n    save(conanfile, file_path, content, encoding=encoding)\n</parameter>\n<parameter=new_str>\n    content = content.replace(search, replace)\n    save(conanfile, file_path, content, encoding=encoding)\n    return True\n</parameter>\n</function>",
+            # "role": "assistant"
+            # },
             {
-            "content": "OBSERVATION:\nWARNING: replace_in_file didn't find pattern 'Pattern' in 'test.txt' file.\r\nPattern not found result: False\r\nPattern found result: None",
-            "role": "user"
+            "role": "user",
+            "content": "<tool_response>\nThe file `pandas/io/stata.py` has been updated successfully.\n\nDiff:\n\n--- original\n+++ current\n@@ -303,7 +303,7 @@\n \n     elif fmt.startswith((\"%tq\", \"tq\")):\n         # Delta quarters relative to base\n-        ordinals = dates + stata_epoch.year * 4\n+        ordinals = dates + (stata_epoch.year - unix_epoch.year) * 4\n         res = np.array(ordinals, dtype=\"M8[3M]\").astype(\"M8[s]\")\n         return Series(res, index=dates.index)\n \n\n</tool_response>"
             },
             {
-            "content": "The reproduction confirms the issue - when the pattern is not found, it returns `False`, but when the pattern is found and replaced, it returns `None`. This is inconsistent behavior.\n\nLet's fix this by making it return `True` when the pattern is found and replaced:\n\n<function=str_replace_editor>\n<parameter=command>str_replace</parameter>\n<parameter=path>/testbed/conan/tools/files/files.py</parameter>\n<parameter=old_str>\n    content = content.replace(search, replace)\n    save(conanfile, file_path, content, encoding=encoding)\n</parameter>\n<parameter=new_str>\n    content = content.replace(search, replace)\n    save(conanfile, file_path, content, encoding=encoding)\n    return True\n</parameter>\n</function>",
-            "role": "assistant"
-            },
+            "role": "assistant",
+            "content": "Now let me run the tests to verify that the fix works:\n\n<tool_call>\n{\"name\": \"eval\", \"arguments\": {}}\n</tool_call>"
+            }
         ]
     }
     
@@ -51,7 +59,9 @@ def test_agent_sft_transform():
         message_transform=message_transform,
         model_transform=tokenizer,
         enable_token_classification=True,
-        train_on_tool_calls_only=True
+        # train_on_tool_calls_only=True,
+        # tool_call_start_token="<tool_call>",
+        # tool_call_end_token="</tool_call>",
     )
     
     # Apply transform
