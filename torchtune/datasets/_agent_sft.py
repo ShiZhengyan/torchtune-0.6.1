@@ -422,10 +422,10 @@ class AgentSFTTransform(Transform):
                     )
 
                     if self.train_on_tool_calls_only and "labels" in transformed_sample:
-                        labels[token_masks["tool_call_mask"] == 0] = CROSS_ENTROPY_IGNORE_IDX
+                        labels[token_masks["reasoning_mask"] == 1] = CROSS_ENTROPY_IGNORE_IDX
                         transformed_sample["labels"] = labels.numpy().tolist()
                     elif self.train_on_reasoning_only and "labels" in transformed_sample:
-                        labels[token_masks["reasoning_mask"] == 0] = CROSS_ENTROPY_IGNORE_IDX
+                        labels[token_masks["tool_call_mask"] == 1] = CROSS_ENTROPY_IGNORE_IDX
                         transformed_sample["labels"] = labels.numpy().tolist()
             except Exception as e:
                 # If token classification fails, raise the error instead of continuing
