@@ -8,6 +8,12 @@ import torch
 from typing import List, Optional
 from torch import nn
 
+try:
+    from torch.distributed._tensor import DTensor, distribute_tensor
+    DTENSOR_AVAILABLE = True
+except ImportError:
+    DTENSOR_AVAILABLE = False
+
 
 def _resize_model_embeddings(model: nn.Module, new_vocab_size: int) -> None:
     """
@@ -100,24 +106,71 @@ def _init_new_token_embeddings(
                     
                     # Filter out any IDs that are >= original_vocab_size (avoid new tokens)
                     valid_ids = input_ids_tensor[input_ids_tensor < original_vocab_size]
-                    
+
                     if len(valid_ids) > 0:
-                        # Get embeddings for the token components
-                        token_embeddings = embedding_layer.weight[valid_ids]
+                        # Handle DTensor case for distributed training
+                        embedding_weight = embedding_layer.weight
+                        is_dtensor = DTENSOR_AVAILABLE and isinstance(embedding_weight, DTensor)
+                        
+                        if is_dtensor:
+                            # For DTensor, we need to work with the full tensor for indexing operations
+                            # Store metadata for redistribution
+                            device_mesh = embedding_weight.device_mesh
+                            placements = embedding_weight.placements
+                            # Get the full tensor to perform indexing
+                            full_embedding_weight = embedding_weight.full_tensor()
+                            # Convert valid_ids to same device as full tensor
+                            valid_ids = valid_ids.to(full_embedding_weight.device)
+                            # Get embeddings for the token components
+                            token_embeddings = full_embedding_weight[valid_ids]
+                        else:
+                            # Regular tensor case
+                            token_embeddings = embedding_weight[valid_ids]
                         
                         # Compute mean embedding as initialization
                         mean_embedding = token_embeddings.mean(dim=0).to(dtype)
                         
                         # Set the new token's embedding
-                        embedding_layer.weight[new_token_id].copy_(mean_embedding)
+                        if is_dtensor:
+                            # For DTensor, update the full tensor and redistribute
+                            full_embedding_weight[new_token_id].copy_(mean_embedding)
+                            # Redistribute the updated tensor
+                            updated_dtensor = distribute_tensor(
+                                full_embedding_weight, device_mesh, placements
+                            )
+                            embedding_layer.weight = updated_dtensor
+                        else:
+                            # Regular tensor case
+                            embedding_layer.weight[new_token_id].copy_(mean_embedding)
                         continue
                 
                 # Fallback to random sampling if no valid encoding
-                sample_size = min(100, original_vocab_size)
+                sample_size = min(100, original_vocab_size)  
                 sample_ids = torch.randint(0, original_vocab_size, (sample_size,), device=device, dtype=torch.long)
-                sample_embeddings = embedding_layer.weight[sample_ids]
-                mean_embedding = sample_embeddings.mean(dim=0).to(dtype)
-                embedding_layer.weight[new_token_id].copy_(mean_embedding)
+                
+                # Handle DTensor case for fallback as well
+                embedding_weight = embedding_layer.weight
+                is_dtensor = DTENSOR_AVAILABLE and isinstance(embedding_weight, DTensor)
+                
+                if is_dtensor:
+                    # For DTensor, we need to work with the full tensor for indexing operations
+                    device_mesh = embedding_weight.device_mesh
+                    placements = embedding_weight.placements
+                    full_embedding_weight = embedding_weight.full_tensor()
+                    sample_ids = sample_ids.to(full_embedding_weight.device)
+                    sample_embeddings = full_embedding_weight[sample_ids]
+                    mean_embedding = sample_embeddings.mean(dim=0).to(dtype)
+                    # Update full tensor and redistribute
+                    full_embedding_weight[new_token_id].copy_(mean_embedding)
+                    updated_dtensor = distribute_tensor(
+                        full_embedding_weight, device_mesh, placements
+                    )
+                    embedding_layer.weight = updated_dtensor
+                else:
+                    # Regular tensor case
+                    sample_embeddings = embedding_weight[sample_ids]
+                    mean_embedding = sample_embeddings.mean(dim=0).to(dtype)
+                    embedding_layer.weight[new_token_id].copy_(mean_embedding)
 
 
 def extend_tokenizer_if_needed(
