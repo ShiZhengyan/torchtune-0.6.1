@@ -9,7 +9,7 @@ from typing import List, Optional
 from torch import nn
 
 try:
-    from torch.distributed._tensor import DTensor, distribute_tensor
+    from torch.distributed._tensor import DTensor, distribute_tensor, is_dtensor
     DTENSOR_AVAILABLE = True
 except ImportError:
     DTENSOR_AVAILABLE = False
@@ -110,37 +110,28 @@ def _init_new_token_embeddings(
                     if len(valid_ids) > 0:
                         # Handle DTensor case for distributed training
                         embedding_weight = embedding_layer.weight
-                        is_dtensor = DTENSOR_AVAILABLE and isinstance(embedding_weight, DTensor)
-                        
-                        if is_dtensor:
-                            # For DTensor, we need to work with the full tensor for indexing operations
-                            # Store metadata for redistribution
-                            device_mesh = embedding_weight.device_mesh
-                            placements = embedding_weight.placements
-                            # Get the full tensor to perform indexing
-                            full_embedding_weight = embedding_weight.full_tensor()
-                            # Convert valid_ids to same device as full tensor
-                            valid_ids = valid_ids.to(full_embedding_weight.device)
-                            # Get embeddings for the token components
-                            token_embeddings = full_embedding_weight[valid_ids]
-                        else:
-                            # Regular tensor case
-                            token_embeddings = embedding_weight[valid_ids]
+                        # ---- new DTensor handling ----
+                        full_weight, device_mesh, placements = _unwrap_dtensor(
+                            embedding_layer.weight
+                        )
+
+                        if full_weight is not None:  # DTensor / Parameter-DTensor
+                            valid_ids = valid_ids.to(full_weight.device)
+                            token_embeddings = full_weight[valid_ids]
+                        else:                        # regular tensor
+                            token_embeddings = embedding_layer.weight[valid_ids]
                         
                         # Compute mean embedding as initialization
                         mean_embedding = token_embeddings.mean(dim=0).to(dtype)
-                        
-                        # Set the new token's embedding
-                        if is_dtensor:
-                            # For DTensor, update the full tensor and redistribute
-                            full_embedding_weight[new_token_id].copy_(mean_embedding)
-                            # Redistribute the updated tensor
-                            updated_dtensor = distribute_tensor(
-                                full_embedding_weight, device_mesh, placements
-                            )
-                            embedding_layer.weight = updated_dtensor
+
+                        if full_weight is not None:
+                            full_weight[new_token_id].copy_(mean_embedding)
+                            updated = distribute_tensor(full_weight, device_mesh, placements)
+                            if isinstance(embedding_layer.weight, torch.nn.Parameter):
+                                embedding_layer.weight.data = updated
+                            else:
+                                embedding_layer.weight = updated
                         else:
-                            # Regular tensor case
                             embedding_layer.weight[new_token_id].copy_(mean_embedding)
                         continue
                 
@@ -148,29 +139,45 @@ def _init_new_token_embeddings(
                 sample_size = min(100, original_vocab_size)  
                 sample_ids = torch.randint(0, original_vocab_size, (sample_size,), device=device, dtype=torch.long)
                 
-                # Handle DTensor case for fallback as well
-                embedding_weight = embedding_layer.weight
-                is_dtensor = DTENSOR_AVAILABLE and isinstance(embedding_weight, DTensor)
-                
-                if is_dtensor:
-                    # For DTensor, we need to work with the full tensor for indexing operations
-                    device_mesh = embedding_weight.device_mesh
-                    placements = embedding_weight.placements
-                    full_embedding_weight = embedding_weight.full_tensor()
-                    sample_ids = sample_ids.to(full_embedding_weight.device)
-                    sample_embeddings = full_embedding_weight[sample_ids]
+                # ---- fallback branch ----
+                full_weight, device_mesh, placements = _unwrap_dtensor(
+                    embedding_layer.weight
+                )
+
+                if full_weight is not None:
+                    sample_ids = sample_ids.to(full_weight.device)
+                    sample_embeddings = full_weight[sample_ids]
                     mean_embedding = sample_embeddings.mean(dim=0).to(dtype)
-                    # Update full tensor and redistribute
-                    full_embedding_weight[new_token_id].copy_(mean_embedding)
-                    updated_dtensor = distribute_tensor(
-                        full_embedding_weight, device_mesh, placements
-                    )
-                    embedding_layer.weight = updated_dtensor
+                    full_weight[new_token_id].copy_(mean_embedding)
+                    updated = distribute_tensor(full_weight, device_mesh, placements)
+                    if isinstance(embedding_layer.weight, torch.nn.Parameter):
+                        embedding_layer.weight.data = updated
+                    else:
+                        embedding_layer.weight = updated
                 else:
                     # Regular tensor case
-                    sample_embeddings = embedding_weight[sample_ids]
+                    sample_embeddings = embedding_layer.weight[sample_ids]
                     mean_embedding = sample_embeddings.mean(dim=0).to(dtype)
                     embedding_layer.weight[new_token_id].copy_(mean_embedding)
+
+
+def _unwrap_dtensor(t):
+    """
+    If `t` is a DTensor or a torch.nn.Parameter whose .data is a DTensor
+    return (full_tensor, device_mesh, placements); otherwise return
+    (None, None, None).
+    """
+    if not DTENSOR_AVAILABLE:
+        return None, None, None
+
+    if isinstance(t, DTensor):
+        return t.full_tensor(), t.device_mesh, t.placements
+
+    if isinstance(t, torch.nn.Parameter) and isinstance(t.data, DTensor):
+        dt = t.data
+        return dt.full_tensor(), dt.device_mesh, dt.placements
+
+    return None, None, None
 
 
 def extend_tokenizer_if_needed(
