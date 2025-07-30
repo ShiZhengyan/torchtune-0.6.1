@@ -13,7 +13,7 @@ from ._device import (
     get_world_size_and_rank,
 )
 from ._logging import get_logger, log_rank_zero
-
+from ._tokenizer_extension import extend_tokenizer_if_needed, _resize_model_embeddings, _init_new_token_embeddings
 from ._version import torch_version_ge
 
 __all__ = [
@@ -26,4 +26,7 @@ __all__ = [
     "get_torch_device_namespace",
     "DeviceSupport",
     "log_rank_zero",
+    "extend_tokenizer_if_needed",
+    "_resize_model_embeddings",
+    "_init_new_token_embeddings",
 ]

@@ -60,6 +60,7 @@ def test_agent_sft_transform():
         model_transform=tokenizer,
         enable_token_classification=True,
         # train_on_tool_calls_only=True,
+        # train_on_reasoning_only=True,
         # tool_call_start_token="<tool_call>",
         # tool_call_end_token="</tool_call>",
     )

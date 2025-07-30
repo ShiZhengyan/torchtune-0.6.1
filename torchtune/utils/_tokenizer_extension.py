@@ -1,0 +1,213 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import torch
+from typing import List, Optional
+from torch import nn
+
+
+def _resize_model_embeddings(model: nn.Module, new_vocab_size: int) -> None:
+    """
+    Resize embedding layers in the model to accommodate new vocabulary size.
+    
+    Args:
+        model: The model with embedding layers to resize
+        new_vocab_size: New vocabulary size
+    """
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Embedding):
+            if module.num_embeddings < new_vocab_size:
+                # Create new embedding layer with expanded size
+                old_weight = module.weight.data
+                new_embedding = nn.Embedding(
+                    new_vocab_size, 
+                    module.embedding_dim,
+                    padding_idx=module.padding_idx,
+                    max_norm=module.max_norm,
+                    norm_type=module.norm_type,
+                    scale_grad_by_freq=module.scale_grad_by_freq,
+                    sparse=module.sparse,
+                ).to(old_weight.device)
+                
+                # Copy old weights
+                new_embedding.weight.data[:module.num_embeddings] = old_weight
+                
+                # Replace the module
+                parent_name = '.'.join(name.split('.')[:-1])
+                child_name = name.split('.')[-1]
+                if parent_name:
+                    parent_module = model
+                    for part in parent_name.split('.'):
+                        parent_module = getattr(parent_module, part)
+                    setattr(parent_module, child_name, new_embedding)
+                else:
+                    setattr(model, child_name, new_embedding)
+
+
+def _init_new_token_embeddings(
+    tokenizer,
+    model: nn.Module,
+    tokens_to_add: List[str],
+    token_encodings: List[List[int]],
+    original_vocab_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """
+    Initialize embeddings for newly added tokens using semantic mean embedding approach.
+    
+    For each new token, the initialization works as follows:
+    1. Use pre-computed encodings of the token string (e.g., "str_replace_editor" -> [id1, id2, id3])
+    2. Get the embedding representations for those input IDs
+    3. Compute the mean of these embeddings as the initialization for the new token
+    
+    Args:
+        tokenizer: The tokenizer instance
+        model: The model with embedding layers to update
+        tokens_to_add: List of new tokens that were added
+        token_encodings: Pre-computed encodings for each token (before they were added to tokenizer)
+        original_vocab_size: Size of vocabulary before adding new tokens
+        device: Device to perform computations on
+        dtype: Data type for computations
+    """
+    if not tokens_to_add or not token_encodings:
+        return
+    
+    # Find embedding layers in the model
+    embedding_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Embedding):
+            embedding_layers.append((name, module))
+    
+    if not embedding_layers:
+        return
+    
+    with torch.no_grad():
+        for i, (token, input_ids) in enumerate(zip(tokens_to_add, token_encodings)):
+            new_token_id = original_vocab_size + i
+            
+            # Initialize embeddings for all embedding layers
+            for _, embedding_layer in embedding_layers:
+                if new_token_id >= embedding_layer.num_embeddings:
+                    continue
+                
+                if input_ids:
+                    # Convert to tensor and move to correct device
+                    input_ids_tensor = torch.tensor(input_ids, device=device, dtype=torch.long)
+                    
+                    # Filter out any IDs that are >= original_vocab_size (avoid new tokens)
+                    valid_ids = input_ids_tensor[input_ids_tensor < original_vocab_size]
+                    
+                    if len(valid_ids) > 0:
+                        # Get embeddings for the token components
+                        token_embeddings = embedding_layer.weight[valid_ids]
+                        
+                        # Compute mean embedding as initialization
+                        mean_embedding = token_embeddings.mean(dim=0).to(dtype)
+                        
+                        # Set the new token's embedding
+                        embedding_layer.weight[new_token_id].copy_(mean_embedding)
+                        continue
+                
+                # Fallback to random sampling if no valid encoding
+                sample_size = min(100, original_vocab_size)
+                sample_ids = torch.randint(0, original_vocab_size, (sample_size,), device=device, dtype=torch.long)
+                sample_embeddings = embedding_layer.weight[sample_ids]
+                mean_embedding = sample_embeddings.mean(dim=0).to(dtype)
+                embedding_layer.weight[new_token_id].copy_(mean_embedding)
+
+
+def extend_tokenizer_if_needed(
+    tokenizer,
+    tool_call_special_tokens: List[str],
+    model: nn.Module,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[List[str]]:
+    """
+    Extend tokenizer with tool call special tokens if needed.
+    
+    Args:
+        tokenizer: The tokenizer instance
+        tool_call_special_tokens: List of special tokens to add
+        model: The model instance
+        device: Device for computations
+        dtype: Data type for computations
+    
+    Returns:
+        List of tokens that were added, or None if no tokens were added
+    """
+    if not tool_call_special_tokens:
+        return None
+    
+    # Find tokens that need to be added
+    existing_vocab = tokenizer.encoder
+    tokens_to_add = [tok for tok in tool_call_special_tokens if tok not in existing_vocab]
+    
+    if not tokens_to_add:
+        return None
+    
+    # Pre-compute encodings for semantic initialization (before adding tokens to tokenizer)
+    original_vocab_size = len(existing_vocab)
+    token_encodings = []
+    
+    for token in tokens_to_add:
+        try:
+            input_ids = tokenizer.encode(token, add_bos=False, add_eos=False)
+            token_encodings.append(input_ids)
+        except Exception as e:
+            print(f"Warning: Failed to encode token '{token}' for semantic initialization: {e}")
+            token_encodings.append([])  # Empty list as fallback
+    
+    # Find the next available token ID by checking existing tokens
+    # We need to find the maximum token ID across all tokenizer dictionaries
+    max_existing_id = 0
+    
+    # Check all possible sources of existing token IDs
+    if hasattr(tokenizer, 'special_tokens') and tokenizer.special_tokens:
+        max_existing_id = max(max_existing_id, max(tokenizer.special_tokens.values()))
+    
+    if hasattr(tokenizer, 'encoder') and tokenizer.encoder:
+        max_existing_id = max(max_existing_id, max(tokenizer.encoder.values()))
+    
+    # Fallback to original_vocab_size if no existing tokens found
+    if max_existing_id == 0:
+        max_existing_id = original_vocab_size - 1
+    
+    # Start assigning new token IDs from the next available ID
+    next_available_id = max_existing_id + 1
+    
+    # Manually add new tokens to tokenizer
+    num_added = 0
+    
+    for token in tokens_to_add:
+        # Add to special tokens with new id
+        new_token_id = next_available_id + num_added
+        tokenizer.special_tokens[token] = new_token_id
+        tokenizer._special_tokens_reversed[new_token_id] = token
+        # Also add to encoder for consistency
+        tokenizer.encoder[token] = new_token_id
+        tokenizer.decoder[new_token_id] = token
+        num_added += 1
+    
+    if num_added > 0:
+        # Update the pattern for special tokens
+        import regex as re
+        tokenizer._pattern_split_special_tokens = re.compile(
+            r"(\L<options>)", options=tokenizer.special_tokens.keys()
+        )
+        
+        # Resize model embeddings to accommodate new tokens
+        new_total_vocab_size = next_available_id + num_added
+        _resize_model_embeddings(model, new_total_vocab_size)
+        
+        # Initialize embeddings for the new tokens using pre-computed encodings
+        _init_new_token_embeddings(tokenizer, model, tokens_to_add, token_encodings, original_vocab_size, device, dtype)
+        
+        print(f"Added {num_added} special tokens to tokenizer: {tokens_to_add}")
+        return tokens_to_add
+    
+    return None

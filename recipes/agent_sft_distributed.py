@@ -257,6 +257,114 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
             ac_option=cfg.get("ac_option", None),
         )
         self._tokenizer = config.instantiate(cfg.tokenizer)
+        
+        # Extend tokenizer with special tokens if configured
+        utils.log_rank_zero(log, f"🔍 Checking tool_call_special_tokens configuration...")
+        utils.log_rank_zero(log, f"🔍 hasattr(cfg, 'tool_call_special_tokens'): {hasattr(cfg, 'tool_call_special_tokens')}")
+        if hasattr(cfg, 'tool_call_special_tokens'):
+            utils.log_rank_zero(log, f"🔍 cfg.tool_call_special_tokens value: {cfg.tool_call_special_tokens}")
+            utils.log_rank_zero(log, f"🔍 cfg.tool_call_special_tokens is truthy: {bool(cfg.tool_call_special_tokens)}")
+        
+        if hasattr(cfg, 'tool_call_special_tokens') and cfg.tool_call_special_tokens:
+            utils.log_rank_zero(log, f"✅ Tool call special tokens configuration detected!")
+            vocab_size_before = len(self._tokenizer.encoder)
+            utils.log_rank_zero(log, f"📊 Vocabulary size before extension: {vocab_size_before}")
+            
+            added_tokens = utils.extend_tokenizer_if_needed(
+                self._tokenizer, cfg.tool_call_special_tokens, self._model, self._device, self._dtype
+            )
+            utils.log_rank_zero(log, f"🔧 extend_tokenizer_if_needed returned: {added_tokens}")
+            
+            vocab_size_after = len(self._tokenizer.encoder)
+            utils.log_rank_zero(log, f"📊 Vocabulary size after extension: {vocab_size_after}")
+
+            # Log sample tokenization to show how data is tokenized with special tokens
+            sample_data = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "This is user message"
+                    },
+                    {
+                        "content": "Let's run the reproduction script:\n\n<function=bash>\n<parameter=command>cd /testbed && python reproduce.py</parameter>\n</function>The is the reasoning end",
+                        "role": "assistant"
+                    },
+                    {
+                        "role": "user",
+                        "content": "<tool_response>\nThe file `pandas/io/stata.py` has been updated successfully.\n</tool_response>"
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Let's look at the implementation in conan/tools/files/files.py:\n\n<function=str_replace_editor>\n<parameter=command>view</parameter>\n<parameter=path>/testbed/conan/tools/files/files.py</parameter>\n</function>"
+                    }
+                ]
+            }
+            
+            utils.log_rank_zero(log, "\n" + "="*80)
+            utils.log_rank_zero(log, "SAMPLE TOKENIZATION WITH SPECIAL TOKENS")
+            utils.log_rank_zero(log, "="*80)
+            utils.log_rank_zero(log, "\nOriginal sample data:")
+            for i, msg in enumerate(sample_data["messages"]):
+                utils.log_rank_zero(log, f"Message {i} ({msg['role']}): {repr(msg['content'])}")
+            
+            try:
+                # Create a sample transform to demonstrate tokenization
+                from torchtune.data._messages import OpenAIToMessages
+                from torchtune.datasets._agent_sft import AgentSFTTransform
+                
+                message_transform = OpenAIToMessages(
+                    train_on_input=False,
+                    column_map={"messages": "messages"},
+                )
+                
+                agent_transform = AgentSFTTransform(
+                    message_transform=message_transform,
+                    model_transform=self._tokenizer,
+                    enable_token_classification=True,
+                )
+                
+                # Apply transform to sample data
+                result = agent_transform(sample_data)
+                
+                # Extract information
+                tokens = result["tokens"]
+                labels = result.get("labels", [])
+                reasoning_mask = result.get("reasoning_mask", [])
+                tool_call_mask = result.get("tool_call_mask", [])
+                
+                utils.log_rank_zero(log, f"\nTotal tokens: {len(tokens)}")
+                utils.log_rank_zero(log, f"Labels length: {len(labels)}")
+                utils.log_rank_zero(log, f"Reasoning mask length: {len(reasoning_mask)}")
+                utils.log_rank_zero(log, f"Tool call mask length: {len(tool_call_mask)}")
+                
+                # Show detailed token analysis (first 50 tokens to avoid too much output)
+                utils.log_rank_zero(log, f"\n{'Index':<6} {'Token ID':<10} {'Token Text':<25} {'Label':<10} {'Reasoning':<10} {'Tool Call':<10}")
+                utils.log_rank_zero(log, "-" * 80)
+                
+                for i in range(len(tokens)):
+                    token_id = tokens[i]
+                    
+                    # Decode individual token
+                    token_text = self._tokenizer.decode([token_id], skip_special_tokens=False)
+                    token_text = repr(token_text)[:20] + ("..." if len(repr(token_text)) > 20 else "")
+                    
+                    label = labels[i] if i < len(labels) else "N/A"
+                    reasoning = reasoning_mask[i] if i < len(reasoning_mask) else "N/A"
+                    tool_call = tool_call_mask[i] if i < len(tool_call_mask) else "N/A"
+                    
+                    utils.log_rank_zero(log, f"{i:<6} {token_id:<10} {token_text:<25} {label:<10} {reasoning:<10} {tool_call:<10}")
+                
+                # Summary statistics
+                utils.log_rank_zero(log, "\n" + "="*80)
+                utils.log_rank_zero(log, "SUMMARY STATISTICS")
+                utils.log_rank_zero(log, "="*80)
+                
+            except Exception as e:
+                utils.log_rank_zero(log, f"Error during sample tokenization logging: {e}")
+                import traceback
+                utils.log_rank_zero(log, traceback.format_exc())
+            
+            utils.log_rank_zero(log, "="*80)
 
         self._optimizer = self._setup_optimizer(
             cfg_optimizer=cfg.optimizer,

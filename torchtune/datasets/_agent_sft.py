@@ -262,6 +262,7 @@ class AgentSFTDataset:
         split: str = "train",
         enable_token_classification: bool = True,
         train_on_tool_calls_only: bool = False,       # <── NEW ARG
+        train_on_reasoning_only: bool = False,        # <── NEW ARG
         tool_call_start_token: str = "<function",
         tool_call_end_token: str = "</function>",
         **load_dataset_kwargs: Dict[str, Any],
@@ -288,7 +289,9 @@ class AgentSFTDataset:
             enable_token_classification (bool): whether to enable token classification for agent metrics.
                 Default is True.
             train_on_tool_calls_only (bool): whether to replace labels of non-tool-call tokens with
-                `CROSS_ENTROPY_IGNORE_IDX`. Default is True.
+                `CROSS_ENTROPY_IGNORE_IDX`. Default is False.
+            train_on_reasoning_only (bool): whether to replace labels of non-reasoning tokens with
+                `CROSS_ENTROPY_IGNORE_IDX`. Default is False.
             tool_call_start_token (str): Start token for tool calls. Default is "<function".
             tool_call_end_token (str): End token for tool calls. Default is "</function>".
             **load_dataset_kwargs (Dict[str, Any]): additional keyword arguments to pass to ``load_dataset``.
@@ -328,6 +331,7 @@ class AgentSFTDataset:
                 model_transform=tokenizer,
                 enable_token_classification=True,
                 train_on_tool_calls_only=train_on_tool_calls_only,   # <── pass through
+                train_on_reasoning_only=train_on_reasoning_only,     # <── pass through
                 tool_call_start_token=tool_call_start_token,
                 tool_call_end_token=tool_call_end_token,
             )
@@ -359,6 +363,7 @@ class AgentSFTTransform(Transform):
         model_transform: Optional[Transform] = None,
         enable_token_classification: bool = True,
         train_on_tool_calls_only: bool = False,
+        train_on_reasoning_only: bool = False,
         tool_call_start_token: str = "<function",
         tool_call_end_token: str = "</function>",
     ):
@@ -369,6 +374,8 @@ class AgentSFTTransform(Transform):
             enable_token_classification: Whether to enable token classification for metrics
             train_on_tool_calls_only: Whether to replace labels of non-tool-call tokens with
                 `CROSS_ENTROPY_IGNORE_IDX`. Default is False.
+            train_on_reasoning_only: Whether to replace labels of non-reasoning tokens with
+                `CROSS_ENTROPY_IGNORE_IDX`. Default is False.
             tool_call_start_token: Start token for tool calls (default: "<function")
             tool_call_end_token: End token for tool calls (default: "</function>")
         """
@@ -378,6 +385,7 @@ class AgentSFTTransform(Transform):
         )
         self.enable_token_classification = enable_token_classification
         self.train_on_tool_calls_only = train_on_tool_calls_only  # <── store
+        self.train_on_reasoning_only = train_on_reasoning_only    # <── store
         self._model_transform = model_transform
         self.tool_call_start_token = tool_call_start_token
         self.tool_call_end_token = tool_call_end_token
@@ -415,6 +423,9 @@ class AgentSFTTransform(Transform):
 
                     if self.train_on_tool_calls_only and "labels" in transformed_sample:
                         labels[token_masks["tool_call_mask"] == 0] = CROSS_ENTROPY_IGNORE_IDX
+                        transformed_sample["labels"] = labels.numpy().tolist()
+                    elif self.train_on_reasoning_only and "labels" in transformed_sample:
+                        labels[token_masks["reasoning_mask"] == 0] = CROSS_ENTROPY_IGNORE_IDX
                         transformed_sample["labels"] = labels.numpy().tolist()
             except Exception as e:
                 # If token classification fails, raise the error instead of continuing

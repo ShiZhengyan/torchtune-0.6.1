@@ -1,0 +1,170 @@
+exp_name: swe-agent-sft-distributed-placeholder
+output_dir: llm-weights/final/${exp_name}
+
+# Model Arguments
+model:
+  _component_: torchtune.models.qwen2_5.qwen2_5_32b_instruct
+
+tokenizer:
+  _component_: torchtune.models.qwen2_5.qwen2_5_tokenizer
+  path: llm-weights/SWE-bench/SWE-agent-LM-32B/vocab.json
+  merges_file: llm-weights/SWE-bench/SWE-agent-LM-32B/merges.txt
+  max_seq_len: 32768
+
+tool_call_special_tokens: [
+    "<function=",
+    "</function>",
+    "<parameter=",
+    "</parameter>",
+    "bash",
+    "submit",
+    "str_replace_editor",
+    "command",
+    "path",
+    "file_text",
+    "old_str",
+    "new_str",
+    "insert_line",
+    "view_range",
+    "view",
+    "create",
+    "str_replace",
+    "insert",
+    "undo_edit",
+]
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: llm-weights/SWE-bench/SWE-agent-LM-32B
+  checkpoint_files: [
+    model-00001-of-00014.safetensors,
+    model-00002-of-00014.safetensors,
+    model-00003-of-00014.safetensors,
+    model-00004-of-00014.safetensors,
+    model-00005-of-00014.safetensors,
+    model-00006-of-00014.safetensors,
+    model-00007-of-00014.safetensors,
+    model-00008-of-00014.safetensors,
+    model-00009-of-00014.safetensors,
+    model-00010-of-00014.safetensors,
+    model-00011-of-00014.safetensors,
+    model-00012-of-00014.safetensors,
+    model-00013-of-00014.safetensors,
+    model-00014-of-00014.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2
+  safe_serialization: True
+resume_from_checkpoint: False
+keep_last_n_checkpoints: 1
+
+# Dataset and Sampler - Using AgentSFTDataset for enhanced metrics
+dataset:
+  _component_: torchtune.datasets.AgentSFTDataset
+  source: json
+  data_files: datasets/ft_xml_all.jsonl
+  split: train[:95%]
+  conversation_column: messages
+  conversation_style: openai
+  train_on_input: False
+  new_system_prompt: null
+  packed: False  # True increases speed
+  enable_token_classification: True  # Enable token classification for agent metrics
+  tool_call_start_token: "<function"  # Configurable start token for tool calls
+  tool_call_end_token: "</function>"  # Configurable end token for tool calls
+
+# Validation - Using AgentSFTDataset for enhanced validation metrics
+dataset_val:
+  _component_: torchtune.datasets.AgentSFTDataset
+  source: json
+  data_files: datasets/ft_xml_all.jsonl
+  split: train[95%:]
+  conversation_column: messages
+  conversation_style: openai
+  train_on_input: False
+  new_system_prompt: null
+  packed: False
+  enable_token_classification: True
+  tool_call_start_token: "<function"  # Configurable start token for tool calls
+  tool_call_end_token: "</function>"  # Configurable end token for tool calls
+
+seed: 42
+shuffle: True
+batch_size: 1
+batch_size_val: 1
+
+# Validation
+run_val_every_n_steps: 10
+
+# Optimizer and Scheduler
+optimizer:
+  _component_: torch.optim.AdamW
+  fused: True
+  weight_decay: 0.01
+  lr: 5e-5
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 5
+optimizer_in_bwd: False
+loss:
+  _component_: torchtune.modules.loss.CEWithChunkedOutputLoss
+
+# Training
+epochs: 3
+max_steps_per_epoch: null
+gradient_accumulation_steps: 1 # Use to increase virtual batch size
+compile: True  # pytorch compile, set to true for better perf/memory
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.WandBLogger
+  project: devrl-sft
+  group: ${exp_name}
+  name: ${exp_name}
+  job_type: agent_sft_distributed
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Validation logging
+log_val_loss: True
+
+# Agent SFT specific configurations
+enable_detailed_metrics: True  # Enable detailed metrics tracking
+enable_token_classification: True  # Enable token classification
+entropy_k: 10  # Number of top probabilities for entropy calculation
+log_detailed_metrics_every_n_steps: 10  # Log detailed metrics every N steps
+
+# Environment
+device: cuda
+dtype: bf16
+enable_activation_checkpointing: True  # True reduces memory
+enable_activation_offloading: False  # True reduces memory
+# custom_sharded_layers: ['tok_embeddings']  # Layers to shard separately (useful for large vocab size models). Lower Memory, but lower speed.
+
+# Show case the usage of pytorch profiler
+# Set enabled to False as it's only needed for debugging training
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+
+  enabled: False
+
+  #Output directory of trace artifacts
+  output_dir: ${output_dir}/profiling_outputs
+
+  #`torch.profiler.ProfilerActivity` types to trace
+  cpu: True
+  cuda: True
+
+  #trace options passed to `torch.profiler.profile`
+  profile_memory: False
+  with_stack: False
+  record_shapes: True
+  with_flops: False
+
+  # `torch.profiler.schedule` options:
+  # wait_steps -> wait, warmup_steps -> warmup, active_steps -> active, num_cycles -> repeat
+  wait_steps: 5
+  warmup_steps: 5
+  active_steps: 2
+  num_cycles: 1
