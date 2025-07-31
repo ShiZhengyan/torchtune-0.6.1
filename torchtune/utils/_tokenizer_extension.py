@@ -8,6 +8,7 @@ import torch
 from typing import List, Optional
 from torch import nn
 from torch.distributed._tensor import DTensor  # type: ignore
+from torch.distributed import is_initialized, barrier, broadcast
 
 
 def _resize_model_embeddings(model: nn.Module, new_vocab_size: int) -> None:
@@ -105,20 +106,17 @@ def _init_new_token_embeddings(
                     if len(valid_ids) > 0:
                         # Get token embeddings for semantic initialization
                         weight = embedding_layer.weight
-                        print(f'type(weight)={type(weight)}')
                         if isinstance(weight, DTensor):
-                            weight = weight.to_local()
-                            print(f'weight is DTensor, converted to local shard')
-                            print(f'weight type after conversion: {type(weight)}')
-                        token_embeddings = weight[valid_ids]
-                        mean_embedding = token_embeddings.mean(dim=0).to(dtype)
+                            # For DTensor, gather the full tensor from all ranks to access all embeddings
+                            # full_tensor() performs necessary collectives to gather local tensors from all ranks
+                            weight = weight.full_tensor()
 
-                        # Pass the already-local shard to avoid another to_local()
-                        _sync_parameter_update(
-                            embedding_layer, new_token_id, mean_embedding, local_weight=weight
-                        )
+                        token_embeddings = weight[valid_ids]
+                        
+                        mean_embedding = token_embeddings.mean(dim=0).to(dtype)
+                        _sync_parameter_update(embedding_layer, new_token_id, mean_embedding)
                         continue
-                
+
                 # Fallback to random sampling if no valid encoding
                 sample_size = min(100, original_vocab_size)
                 sample_ids = torch.randint(0, original_vocab_size, (sample_size,), device=device, dtype=torch.long)
@@ -126,12 +124,10 @@ def _init_new_token_embeddings(
                 # Get sample embeddings robustly (DTensor aware)
                 sample_weight = embedding_layer.weight
                 if isinstance(sample_weight, DTensor):
-                    sample_weight = sample_weight.to_local()
+                    sample_weight = sample_weight.full_tensor()
                 sample_embeddings = sample_weight[sample_ids]
                 mean_embedding = sample_embeddings.mean(dim=0).to(dtype)
-                _sync_parameter_update(
-                    embedding_layer, new_token_id, mean_embedding, local_weight=sample_weight
-                )
+                _sync_parameter_update(embedding_layer, new_token_id, mean_embedding)
 
 
 def _is_distributed_training():
@@ -148,35 +144,73 @@ def _sync_parameter_update(
     embedding_layer: nn.Embedding,
     new_token_id: int,
     mean_embedding: torch.Tensor,
-    *,
-    local_weight: Optional[torch.Tensor] = None,
 ):
     """
     Update embedding parameter and ensure synchronization in distributed training.
 
     Args:
         embedding_layer: The embedding layer to update.
-        new_token_id: Index of the new token.
-        mean_embedding: Value to write.
-        local_weight: Optional local shard (avoids a second call to ``to_local()``).
+        new_token_id: Index of the new token (global index).
+        mean_embedding: A 1D tensor of size [embedding_dim].
     """
     weight = embedding_layer.weight
+
+    # 1) DTensor (sharded) path: modify only the local slice
     if isinstance(weight, DTensor):
-        # Use provided local shard if available, else materialize it once
-        local = local_weight if local_weight is not None else weight.to_local()
-        local[new_token_id].copy_(mean_embedding)
-        if _is_distributed_training():
-            torch.distributed.barrier()
+        from torch.distributed._tensor import Shard
+        
+        # Check if the tensor is row-sharded
+        is_row_sharded = any(isinstance(p, Shard) and p.dim == 0 for p in weight.placements)
+        
+        if is_row_sharded:
+            # For row-sharded tensors, we need to determine which rank owns this row
+            global_shape = weight.shape
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+            
+            # Calculate the range of rows owned by each rank
+            rows_per_rank = global_shape[0] // world_size
+            remainder = global_shape[0] % world_size
+            
+            # Ranks 0 to remainder-1 get rows_per_rank + 1 rows
+            # Ranks remainder to world_size-1 get rows_per_rank rows
+            if rank < remainder:
+                start_row = rank * (rows_per_rank + 1)
+                end_row = start_row + rows_per_rank + 1
+            else:
+                start_row = remainder * (rows_per_rank + 1) + (rank - remainder) * rows_per_rank
+                end_row = start_row + rows_per_rank
+            
+            # Check if this rank owns the row for new_token_id
+            if start_row <= new_token_id < end_row:
+                # Convert global index to local index
+                local_index = new_token_id - start_row
+                local_shard = weight.to_local()
+                local_shard[local_index].copy_(mean_embedding)
+            
+            # Synchronize across all ranks (just a barrier, no broadcast needed)
+            if is_initialized():
+                torch.distributed.barrier()
+        else:
+            # For replicated tensors, all ranks have the full tensor
+            local_shard = weight.to_local()
+            local_shard[new_token_id].copy_(mean_embedding)
+            
+            # No broadcast needed - each rank updates its own copy
+            if is_initialized():
+                torch.distributed.barrier()
+
         return
 
-    if not _is_distributed_training():
-        # Single GPU or non-distributed: direct update
-        weight[new_token_id].copy_(mean_embedding)
+    # 2) Non-DTensor, non-distributed: single-GPU
+    if not (is_initialized() and torch.distributed.get_world_size() > 1):
+        weight.data[new_token_id].copy_(mean_embedding)
         return
 
+    # 3) Vanilla distributed (e.g. DDP or ZeRO without DTensor):
     rank = torch.distributed.get_rank()
     if rank == 0:
-        weight[new_token_id].copy_(mean_embedding)
+        weight.data[new_token_id].copy_(mean_embedding)
 
     # Ensure all ranks wait
     torch.distributed.barrier()
