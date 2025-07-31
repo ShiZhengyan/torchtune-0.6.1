@@ -7,12 +7,7 @@
 import torch
 from typing import List, Optional
 from torch import nn
-
-try:
-    from torch.distributed._tensor import DTensor, distribute_tensor, is_dtensor
-    DTENSOR_AVAILABLE = True
-except ImportError:
-    DTENSOR_AVAILABLE = False
+from torch.distributed._tensor import DTensor  # type: ignore
 
 
 def _resize_model_embeddings(model: nn.Module, new_vocab_size: int) -> None:
@@ -99,7 +94,7 @@ def _init_new_token_embeddings(
             for _, embedding_layer in embedding_layers:
                 if new_token_id >= embedding_layer.num_embeddings:
                     continue
-                
+
                 if input_ids:
                     # Convert to tensor and move to correct device
                     input_ids_tensor = torch.tensor(input_ids, device=device, dtype=torch.long)
@@ -108,76 +103,86 @@ def _init_new_token_embeddings(
                     valid_ids = input_ids_tensor[input_ids_tensor < original_vocab_size]
 
                     if len(valid_ids) > 0:
-                        # Handle DTensor case for distributed training
-                        embedding_weight = embedding_layer.weight
-                        # ---- new DTensor handling ----
-                        full_weight, device_mesh, placements = _unwrap_dtensor(
-                            embedding_layer.weight
-                        )
-
-                        if full_weight is not None:  # DTensor / Parameter-DTensor
-                            valid_ids = valid_ids.to(full_weight.device)
-                            token_embeddings = full_weight[valid_ids]
-                        else:                        # regular tensor
-                            token_embeddings = embedding_layer.weight[valid_ids]
-                        
-                        # Compute mean embedding as initialization
+                        # Get token embeddings for semantic initialization
+                        weight = embedding_layer.weight
+                        print(f'type(weight)={type(weight)}')
+                        if isinstance(weight, DTensor):
+                            weight = weight.to_local()
+                            print(f'weight is DTensor, converted to local shard')
+                            print(f'weight type after conversion: {type(weight)}')
+                        token_embeddings = weight[valid_ids]
                         mean_embedding = token_embeddings.mean(dim=0).to(dtype)
 
-                        if full_weight is not None:
-                            full_weight[new_token_id].copy_(mean_embedding)
-                            updated = distribute_tensor(full_weight, device_mesh, placements)
-                            if isinstance(embedding_layer.weight, torch.nn.Parameter):
-                                embedding_layer.weight.data = updated
-                            else:
-                                embedding_layer.weight = updated
-                        else:
-                            embedding_layer.weight[new_token_id].copy_(mean_embedding)
+                        # Pass the already-local shard to avoid another to_local()
+                        _sync_parameter_update(
+                            embedding_layer, new_token_id, mean_embedding, local_weight=weight
+                        )
                         continue
                 
                 # Fallback to random sampling if no valid encoding
-                sample_size = min(100, original_vocab_size)  
+                sample_size = min(100, original_vocab_size)
                 sample_ids = torch.randint(0, original_vocab_size, (sample_size,), device=device, dtype=torch.long)
-                
-                # ---- fallback branch ----
-                full_weight, device_mesh, placements = _unwrap_dtensor(
-                    embedding_layer.weight
+
+                # Get sample embeddings robustly (DTensor aware)
+                sample_weight = embedding_layer.weight
+                if isinstance(sample_weight, DTensor):
+                    sample_weight = sample_weight.to_local()
+                sample_embeddings = sample_weight[sample_ids]
+                mean_embedding = sample_embeddings.mean(dim=0).to(dtype)
+                _sync_parameter_update(
+                    embedding_layer, new_token_id, mean_embedding, local_weight=sample_weight
                 )
 
-                if full_weight is not None:
-                    sample_ids = sample_ids.to(full_weight.device)
-                    sample_embeddings = full_weight[sample_ids]
-                    mean_embedding = sample_embeddings.mean(dim=0).to(dtype)
-                    full_weight[new_token_id].copy_(mean_embedding)
-                    updated = distribute_tensor(full_weight, device_mesh, placements)
-                    if isinstance(embedding_layer.weight, torch.nn.Parameter):
-                        embedding_layer.weight.data = updated
-                    else:
-                        embedding_layer.weight = updated
-                else:
-                    # Regular tensor case
-                    sample_embeddings = embedding_layer.weight[sample_ids]
-                    mean_embedding = sample_embeddings.mean(dim=0).to(dtype)
-                    embedding_layer.weight[new_token_id].copy_(mean_embedding)
 
-
-def _unwrap_dtensor(t):
+def _is_distributed_training():
     """
-    If `t` is a DTensor or a torch.nn.Parameter whose .data is a DTensor
-    return (full_tensor, device_mesh, placements); otherwise return
-    (None, None, None).
+    Check if we're actually in a distributed training context.
+    Returns True only if distributed is initialized and world_size > 1.
     """
-    if not DTENSOR_AVAILABLE:
-        return None, None, None
+    return (torch.distributed.is_available() and 
+            torch.distributed.is_initialized() and 
+            torch.distributed.get_world_size() > 1)
 
-    if isinstance(t, DTensor):
-        return t.full_tensor(), t.device_mesh, t.placements
 
-    if isinstance(t, torch.nn.Parameter) and isinstance(t.data, DTensor):
-        dt = t.data
-        return dt.full_tensor(), dt.device_mesh, dt.placements
+def _sync_parameter_update(
+    embedding_layer: nn.Embedding,
+    new_token_id: int,
+    mean_embedding: torch.Tensor,
+    *,
+    local_weight: Optional[torch.Tensor] = None,
+):
+    """
+    Update embedding parameter and ensure synchronization in distributed training.
 
-    return None, None, None
+    Args:
+        embedding_layer: The embedding layer to update.
+        new_token_id: Index of the new token.
+        mean_embedding: Value to write.
+        local_weight: Optional local shard (avoids a second call to ``to_local()``).
+    """
+    weight = embedding_layer.weight
+    if isinstance(weight, DTensor):
+        # Use provided local shard if available, else materialize it once
+        local = local_weight if local_weight is not None else weight.to_local()
+        local[new_token_id].copy_(mean_embedding)
+        if _is_distributed_training():
+            torch.distributed.barrier()
+        return
+
+    if not _is_distributed_training():
+        # Single GPU or non-distributed: direct update
+        weight[new_token_id].copy_(mean_embedding)
+        return
+
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        weight[new_token_id].copy_(mean_embedding)
+
+    # Ensure all ranks wait
+    torch.distributed.barrier()
+
+    # Broadcast the updated parameter to all ranks
+    torch.distributed.broadcast(weight.data, src=0)
 
 
 def extend_tokenizer_if_needed(
