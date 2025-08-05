@@ -286,7 +286,7 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
                         "content": "This is user message"
                     },
                     {
-                        "content": "Let's run the reproduction script:\n\n<function=bash>\n<parameter=command>cd /testbed && python reproduce.py</parameter>\n</function>The is the reasoning end",
+                        "content": "Let's add the import for `inspect`:\n\n<function=str_replace_editor>\n<parameter=command>str_replace</parameter>\n<parameter=path>/testbed/astropy/coordinates/sky_coordinate.py</parameter>\n<parameter=old_str>\nimport copy\nimport operator\nimport re\nimport warnings\n</parameter>\n<parameter=new_str>\nimport copy\nimport inspect\nimport operator\nimport re\nimport warnings\n</parameter>\n</function>",
                         "role": "assistant"
                     },
                     {
@@ -299,7 +299,7 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
                     }
                 ]
             }
-            
+
             utils.log_rank_zero(log, "\n" + "="*80)
             utils.log_rank_zero(log, "SAMPLE TOKENIZATION WITH SPECIAL TOKENS")
             utils.log_rank_zero(log, "="*80)
@@ -346,7 +346,7 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
                     
                     # Decode individual token
                     token_text = self._tokenizer.decode([token_id], skip_special_tokens=False)
-                    token_text = repr(token_text)[:20] + ("..." if len(repr(token_text)) > 20 else "")
+                    token_text = repr(token_text)
                     
                     label = labels[i] if i < len(labels) else "N/A"
                     reasoning = reasoning_mask[i] if i < len(reasoning_mask) else "N/A"
@@ -434,6 +434,12 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
             utils.log_rank_zero(log, "Validation dataloader is set up.")
         else:
             self._val_dataloader = None
+
+        # Log one example after tokenization
+        train_example = self._dataloader.dataset[0]
+        # input_ids = self._tokenizer(train_example)['tokens']
+        decoded_train_example = self._tokenizer.decode(train_example['tokens'], skip_special_tokens=False)
+        utils.log_rank_zero(log, decoded_train_example)
 
         # Finally update the recipe state which can only be correctly set after all of the
         # other components have been initialized and updated.
