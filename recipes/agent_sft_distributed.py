@@ -268,7 +268,7 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
         if hasattr(cfg, 'tool_call_special_tokens') and cfg.tool_call_special_tokens:
             utils.log_rank_zero(log, f"✅ Tool call special tokens configuration detected!")
             vocab_size_before = len(self._tokenizer.encoder)
-            utils.log_rank_zero(log, f"📊 Vocabulary size before extension: {vocab_size_before}")
+            utils.log_rank_zero(log, f"\n📊 Vocabulary size before extension: {vocab_size_before}")
             
             added_tokens = utils.extend_tokenizer_if_needed(
                 self._tokenizer, cfg.tool_call_special_tokens, self._model, self._device, self._dtype
@@ -276,7 +276,7 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
             utils.log_rank_zero(log, f"🔧 extend_tokenizer_if_needed returned: {added_tokens}")
             
             vocab_size_after = len(self._tokenizer.encoder)
-            utils.log_rank_zero(log, f"📊 Vocabulary size after extension: {vocab_size_after}")
+            utils.log_rank_zero(log, f"\n📊 Vocabulary size after extension: {vocab_size_after}")
 
             # Log sample tokenization to show how data is tokenized with special tokens
             sample_data = {
@@ -1233,6 +1233,15 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
                 ),
                 epoch=curr_epoch,
             )
+            
+            # Update tokenizer.json with extended tokens after checkpoint save
+            if hasattr(self._cfg, 'tool_call_special_tokens') and self._cfg.tool_call_special_tokens:
+                tokenizer_json_path = f"{self._output_dir}/epoch_{curr_epoch}/tokenizer.json"
+                utils.update_tokenizer_json_added_tokens(
+                    self._tokenizer,
+                    tokenizer_json_path
+                )
+                utils.log_rank_zero(log, f"Updated tokenizer.json with extended tokens at {tokenizer_json_path}")
 
         self._profiler.stop()
 

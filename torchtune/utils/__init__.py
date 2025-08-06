@@ -14,6 +14,7 @@ from ._device import (
 )
 from ._logging import get_logger, log_rank_zero
 from ._tokenizer_extension import extend_tokenizer_if_needed, _resize_model_embeddings, _init_new_token_embeddings
+from ._save_extended_tokenizer import update_tokenizer_json_added_tokens
 from ._version import torch_version_ge
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "extend_tokenizer_if_needed",
     "_resize_model_embeddings",
     "_init_new_token_embeddings",
+    "update_tokenizer_json_added_tokens",
 ]
