@@ -116,6 +116,9 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
         self._clip_grad_norm = cfg.get("clip_grad_norm", None)
         self._checkpoint_client = CheckpointClient(cfg)
         
+        # Checkpoint management cfg
+        self._keep_only_last_checkpoint = cfg.get("keep_only_last_checkpoint", False)
+        
         # Validation cfg
         self._enable_validation = cfg.get("dataset_val", None) is not None
         self._run_val_every_n_steps = cfg.get("run_val_every_n_steps", 500) if self._enable_validation else None
@@ -825,6 +828,45 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
         
         return metrics
 
+    def _cleanup_old_checkpoints(self, current_epoch: int) -> None:
+        """
+        Clean up previous epoch checkpoints, keeping only the current one.
+        This helps save disk space by removing older checkpoints.
+        
+        Args:
+            current_epoch (int): The current epoch number
+        """
+        if not self._keep_only_last_checkpoint or not self._is_rank_zero:
+            return
+            
+        import shutil
+        from pathlib import Path
+        
+        # Look for epoch directories to clean up
+        output_dir = Path(self._output_dir)
+        if not output_dir.exists():
+            return
+            
+        # Find all epoch directories
+        epoch_dirs = []
+        for item in output_dir.iterdir():
+            if item.is_dir() and item.name.startswith("epoch_"):
+                try:
+                    epoch_num = int(item.name.split("_")[1])
+                    if epoch_num < current_epoch:  # Only remove older epochs
+                        epoch_dirs.append((epoch_num, item))
+                except (ValueError, IndexError):
+                    # Skip directories that don't match epoch_X pattern
+                    continue
+        
+        # Remove old epoch directories
+        for epoch_num, epoch_dir in epoch_dirs:
+            try:
+                utils.log_rank_zero(log, f"Removing old checkpoint directory: {epoch_dir}")
+                shutil.rmtree(epoch_dir)
+            except Exception as e:
+                utils.log_rank_zero(log, f"Warning: Failed to remove {epoch_dir}: {e}")
+
     def validate(self) -> float:
         """
         Run validation loop and return average validation loss.
@@ -1233,6 +1275,9 @@ class AgentSFTRecipeDistributed(FTRecipeInterface):
                 ),
                 epoch=curr_epoch,
             )
+            
+            # Clean up old checkpoints if configured to do so
+            self._cleanup_old_checkpoints(curr_epoch)
             
             # Update tokenizer.json with extended tokens after checkpoint save
             if hasattr(self._cfg, 'tool_call_special_tokens') and self._cfg.tool_call_special_tokens:
